@@ -18,6 +18,9 @@ kotlin {
     jvm("jvm")
 
     sourceSets {
+        val jvmTest by getting {
+            dependencies { implementation(kotlin("test")) }
+        }
         val jvmMain by getting {
             kotlin.srcDirs(
                 "src/jvmMain/kotlin",
@@ -37,6 +40,10 @@ kotlin {
                 "../nehal-CloudStream/VegaMovies/src/main/kotlin",
                 "../nehal-CloudStream/MovieBoxProviderIN/src/main/kotlin"
             )
+            // Both Redowan providers include the same tracker; compile one shared copy.
+            kotlin.exclude {
+                it.file.canonicalFile == file("../nehal-CloudStream/BdixICCFtp/src/main/kotlin/com/redowan/AnalyticsTracker.kt").canonicalFile
+            }
             dependencies {
                 // CloudStream Core KMP Library
                 implementation("com.lagradost.api:library")

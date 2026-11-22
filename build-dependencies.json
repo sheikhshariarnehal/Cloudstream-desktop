@@ -1,0 +1,12 @@
+{
+  "core": {
+    "repository": "recloudstream/cloudstream",
+    "revision": "2dcc25c3945c61dfa95d1710ced7c74acfe84baa",
+    "directory": "cloudstream"
+  },
+  "providers": {
+    "repository": "nehalDIU/nehal-CloudStream",
+    "revision": "673f061d7a796a693cb744c218e9f4141a9867fe",
+    "directory": "nehal-CloudStream"
+  }
+}

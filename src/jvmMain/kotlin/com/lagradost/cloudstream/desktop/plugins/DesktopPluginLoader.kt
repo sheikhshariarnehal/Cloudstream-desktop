@@ -72,6 +72,7 @@ object DesktopPluginLoader {
 
     fun registerNehalProviders() {
         try {
+            disableBundledProviderTelemetry()
             val providers = listOf<MainAPI>(
                 com.redowan.CircleFtpProvider(),
                 com.redowan.BdixICCFtpProvider(),

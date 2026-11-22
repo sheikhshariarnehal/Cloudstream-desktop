@@ -15,3 +15,13 @@ out/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Local test fixtures, investigation notes and user data
+/tmp/
+/docs/superpowers/
+/.cloudstream_desktop/
+*.log
+*.hprof
+hs_err_pid*
+/.env
+/.env.*
