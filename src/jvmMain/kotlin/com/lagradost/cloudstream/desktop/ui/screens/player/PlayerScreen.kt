@@ -16,21 +16,26 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.toComposeImageBitmap
+import androidx.compose.ui.graphics.asSkiaBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.foundation.focusable
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.onPointerEvent
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.unit.Dp
@@ -40,6 +45,7 @@ import androidx.compose.ui.window.Dialog
 import com.lagradost.cloudstream.desktop.plugins.DesktopPluginLoader
 import com.lagradost.cloudstream.desktop.storage.DesktopDataStore
 import com.lagradost.cloudstream.desktop.storage.WatchProgress
+import com.lagradost.cloudstream.desktop.utils.DesktopStreamProxy
 import com.lagradost.cloudstream.desktop.ui.navigation.StreamSourceInfo
 import com.lagradost.cloudstream.desktop.ui.navigation.SubtitleTrackInfo
 import com.lagradost.cloudstream3.AnimeLoadResponse
@@ -47,6 +53,8 @@ import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.TvSeriesLoadResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -54,6 +62,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uk.co.caprica.vlcj.factory.MediaPlayerFactory
 import uk.co.caprica.vlcj.factory.discovery.NativeDiscovery
+import uk.co.caprica.vlcj.media.MediaStatistics
+import uk.co.caprica.vlcj.player.base.State
 import uk.co.caprica.vlcj.player.base.MediaPlayer
 import uk.co.caprica.vlcj.player.base.TrackDescription
 import uk.co.caprica.vlcj.player.embedded.videosurface.callback.BufferFormat
@@ -63,8 +73,6 @@ import uk.co.caprica.vlcj.player.embedded.videosurface.callback.format.RV32Buffe
 import com.sun.jna.Native
 import com.sun.jna.WString
 import java.awt.Desktop
-import java.awt.image.BufferedImage
-import java.awt.image.DataBufferInt
 import java.io.File
 import java.net.URI
 import java.nio.ByteBuffer
@@ -118,6 +126,8 @@ private fun logVlc(message: String) {
     } catch (_: Exception) {}
 }
 
+private val VideoControlBackground = Color.Black.copy(0.55f)
+
 enum class VideoAspectMode(val label: String, val scale: ContentScale) {
     CROP("Zoom / Fill Screen", ContentScale.Crop),
     STRETCH("Stretch to Fill", ContentScale.FillBounds),
@@ -126,7 +136,7 @@ enum class VideoAspectMode(val label: String, val scale: ContentScale) {
 
 // ─── PlayerScreen ─────────────────────────────────────────────────────────────
 
-@OptIn(ExperimentalFoundationApi::class)
+@OptIn(ExperimentalFoundationApi::class, ExperimentalComposeUiApi::class)
 @Composable
 fun PlayerScreen(
     mediaUrl: String,
@@ -141,6 +151,7 @@ fun PlayerScreen(
     apiName: String = "",
     isFullscreen: Boolean = false,
     onToggleFullscreen: () -> Unit = {},
+    onWindowShortcutsBlockedChange: (Boolean) -> Unit = {},
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -180,7 +191,6 @@ fun PlayerScreen(
         }
     }
     var activeSubtitlesList by remember { mutableStateOf(subtitles) }
-    var isExtractingNextEp by remember { mutableStateOf(false) }
     var showEpisodesPicker by remember { mutableStateOf(false) }
 
     val currentEpIndex = remember(currentEp, activeEpisodeName, allEpisodes) {
@@ -210,11 +220,9 @@ fun PlayerScreen(
     val hasNextEpisode = allEpisodes.isNotEmpty() && currentEpIndex != -1 && currentEpIndex < (allEpisodes.size - 1)
 
     // ── Active Stream Source ──────────────────────────────────────────────────
-    var activeSource by remember {
-        mutableStateOf(
-            activeSourcesList.firstOrNull { it.url == mediaUrl }
-                ?: StreamSourceInfo(name = "Primary Stream", url = mediaUrl, quality = 0, headers = headers)
-        )
+    val initialSource = remember {
+        activeSourcesList.firstOrNull { it.url == mediaUrl && it.headers == headers }
+            ?: StreamSourceInfo(name = "Primary Stream", url = mediaUrl, quality = 0, headers = headers)
     }
 
     var videoAspectMode by remember { mutableStateOf(VideoAspectMode.CROP) }
@@ -234,7 +242,7 @@ fun PlayerScreen(
             val hTitle = h.title.trim().lowercase()
             val tUrl = targetUrl.trim().lowercase()
             val mUrl = mediaUrl.trim().lowercase()
-            val sUrl = activeSource.url.trim().lowercase()
+            val sUrl = initialSource.url.trim().lowercase()
 
             val urlOrTitleMatch = (hUrl == tUrl || hUrl == mUrl || hUrl == sUrl ||
                     hTitle == cleanTitle ||
@@ -254,13 +262,39 @@ fun PlayerScreen(
             } else 0L
         } else 0L
     }
+    val session = remember { PlaybackSession(initialSource, initialPosition) }
+    val playbackRequest = session.request
+    val activeSource = playbackRequest.source
+    val isExtractingNextEp = session.loadingEpisode
+    var desiredPaused by remember { mutableStateOf(false) }
+    var resumeSettled by remember { mutableStateOf(false) }
+    var pendingResumeGeneration by remember { mutableStateOf<Int?>(null) }
+    var completedGeneration by remember { mutableStateOf<Int?>(null) }
+    var lastConfirmedProgress by remember { mutableStateOf<WatchProgress?>(null) }
+    val disposed = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
+    val frameGeneration = remember { java.util.concurrent.atomic.AtomicInteger(-1) }
+    val presentedFrames = remember { java.util.concurrent.atomic.AtomicLong(0) }
+    val frameErrorGeneration = remember { java.util.concurrent.atomic.AtomicInteger(-1) }
+    val activeProxyUrl = remember { java.util.concurrent.atomic.AtomicReference<String?>(null) }
+    val stallDetector = remember(playbackRequest.generation) { PlaybackStallDetector() }
+    var lastPositionFraction by remember { mutableFloatStateOf(Float.NaN) }
+    var lastNativePosition by remember { mutableStateOf(-1L) }
+    var initialProgressObserved by remember { mutableStateOf(false) }
+    var interruptedGeneration by remember { mutableStateOf<Int?>(null) }
+    var mediaWasSeekable by remember { mutableStateOf(false) }
+    var bufferPercent by remember { mutableFloatStateOf(0f) }
     var currentPosition by remember { mutableStateOf(initialPosition) }
-    var totalDuration by remember { mutableStateOf(1L) }
+    var totalDuration by remember { mutableStateOf(0L) }
     var videoFrame by remember { mutableStateOf<ImageBitmap?>(null) }
     var isVideoReady by remember { mutableStateOf(false) }
     var vlcError by remember { mutableStateOf<String?>(null) }
+    var playbackNotice by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(playbackNotice) {
+        if (playbackNotice != null) { delay(6000); playbackNotice = null }
+    }
     var isLocked by remember { mutableStateOf(false) }
     var showControls by remember { mutableStateOf(true) }
+    var controlsInteraction by remember { mutableIntStateOf(0) }
     var isBuffering by remember { mutableStateOf(false) }
 
     // ── Dialog states ─────────────────────────────────────────────────────────
@@ -269,20 +303,170 @@ fun PlayerScreen(
     var showSubtitlePicker by remember { mutableStateOf(false) }
     var showSpeedPicker by remember { mutableStateOf(false) }
     var showVolumePicker by remember { mutableStateOf(false) }
-    var selectedSubtitle by remember { mutableStateOf<SubtitleTrackInfo?>(activeSubtitlesList.firstOrNull()) }
+    var desiredSubtitle by remember { mutableStateOf<SubtitleTrackInfo?>(activeSubtitlesList.firstOrNull()) }
+    var selectedSubtitle by remember { mutableStateOf<SubtitleTrackInfo?>(null) }
+    var subtitleRequestNumber by remember { mutableIntStateOf(0) }
+    var subtitleStatus by remember { mutableStateOf<String?>(null) }
+    var subtitleReloadRequired by remember { mutableStateOf(false) }
+    val externalSubtitleIds = remember { mutableMapOf<String, Int>() }
+    val subtitleDirectory = remember { java.nio.file.Files.createTempDirectory("cloudstream-subtitles-").toFile() }
+    val externalSubtitleFiles = remember { mutableMapOf<String, File>() }
+    var isSeekable by remember { mutableStateOf(false) }
     var seekIndicator by remember { mutableStateOf<String?>(null) }
+
+    // ── Native Decoded Tracks ──────────────────────────────────────────────────
+    var audioTracks by remember { mutableStateOf<List<TrackDescription>>(emptyList()) }
+    var nativeSubTracks by remember { mutableStateOf<List<TrackDescription>>(emptyList()) }
+    var selectedAudioTrackId by remember { mutableStateOf<Int?>(null) }
+    var selectedSubTrackId by remember { mutableStateOf<Int?>(null) }
+
+    // ── Pooled Raw Frames and Latest-Frame Handoff ─────────────────
+    class RawFrameData(val pixels: IntArray, val width: Int, val height: Int, val generation: Int)
+    val arrayPool = remember { java.util.concurrent.ConcurrentLinkedQueue<IntArray>() }
+
+    fun obtainPixelArray(size: Int): IntArray {
+        val existing = arrayPool.poll()
+        return if (existing != null && existing.size >= size) existing else IntArray(size)
+    }
+
+    fun recyclePixelArray(arr: IntArray) {
+        if (arrayPool.size < 8) arrayPool.offer(arr)
+    }
+
+    val pendingRawFrame = remember { java.util.concurrent.atomic.AtomicReference<RawFrameData?>(null) }
+    // Convert only the latest frame, outside the UI thread.
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            val raw = pendingRawFrame.getAndSet(null)
+            if (raw != null) {
+                try {
+                    if (raw.generation != session.request.generation || session.loadingEpisode) continue
+                    val converted = withContext(Dispatchers.Default) {
+                        vlcFrameBitmap(raw.pixels, raw.width, raw.height)
+                    }
+                    if (!disposed.get() && raw.generation == session.request.generation && !session.loadingEpisode) {
+                        videoFrame = converted
+                        presentedFrames.incrementAndGet()
+                    } else converted.asSkiaBitmap().close()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    if (frameErrorGeneration.getAndSet(raw.generation) != raw.generation) {
+                        logVlc("Video frame conversion failed generation=${raw.generation} type=${e.javaClass.simpleName}")
+                    }
+                } finally {
+                    recyclePixelArray(raw.pixels)
+                }
+            }
+            delay(16)
+        }
+    }
+
+    // ── VLC Setup (Created ONCE for lifetime of PlayerScreen) ───────────────────
+    val factoryAndPlayer = remember {
+        val vlcPath = tryConfigureVlc() ?: run {
+            vlcError = "VLC not found. Install from videolan.org"
+            return@remember null
+        }
+        try {
+            val args = buildList {
+                add("--quiet")
+                add("--no-video-title-show")
+                add("--stats")
+                add("--avcodec-threads=0")       // Auto multi-threaded CPU decoding
+                add("--network-caching=2500")    // Optimized 2.5s network buffer for fast stream start
+                add("--file-caching=2500")       // 2.5s file buffer
+                add("--live-caching=2500")
+                add("--http-reconnect")
+            }
+            val factory = MediaPlayerFactory(*args.toTypedArray())
+            val player = factory.mediaPlayers().newEmbeddedMediaPlayer()
+
+            val bufferFmt = object : BufferFormatCallback {
+                override fun getBufferFormat(width: Int, height: Int): BufferFormat {
+                    // Cap max pixel buffer to 1920x1080 for 4K streams (prevents memory copy bottleneck)
+                    val targetW = if (width > 1920) 1920 else width
+                    val targetH = if (width > 1920) (height * 1920) / width else height
+                    return RV32BufferFormat(targetW, targetH)
+                }
+                override fun allocatedBuffers(buffers: Array<ByteBuffer>) {}
+            }
+
+            val render = object : RenderCallback {
+                override fun display(
+                    mp: MediaPlayer,
+                    nativeBuffers: Array<out ByteBuffer>,
+                    fmt: uk.co.caprica.vlcj.player.embedded.videosurface.callback.BufferFormat
+                ) {
+                    try {
+                        val generation = frameGeneration.get()
+                        if (generation < 0 || disposed.get()) return
+                        val fw = fmt.width; val fh = fmt.height
+                        if (fw <= 0 || fh <= 0) return
+                        val buffer = nativeBuffers.firstOrNull() ?: return
+                        buffer.rewind()
+                        val ints = buffer.asIntBuffer()
+                        val count = (fw * fh).coerceAtMost(ints.remaining())
+                        if (count == fw * fh && count > 0) {
+                            val pixels = obtainPixelArray(count)
+                            ints.get(pixels, 0, count)
+                            val oldFrame = pendingRawFrame.getAndSet(RawFrameData(pixels, fw, fh, generation))
+                            if (oldFrame != null) {
+                                recyclePixelArray(oldFrame.pixels)
+                            }
+                        }
+                    } catch (_: Exception) {}
+                }
+            }
+
+            val surface = factory.videoSurfaces().newVideoSurface(bufferFmt, render, true)
+            player.videoSurface().set(surface)
+
+            Pair(factory, player)
+        } catch (e: Exception) {
+            vlcError = e.message ?: "Failed to initialize VLC"
+            null
+        }
+    }
+
+    val player = factoryAndPlayer?.second
+
+    fun recoverPlayback(reason: String) {
+        if (disposed.get() || session.loadingEpisode || desiredPaused || vlcError != null) return
+        val resume = when {
+            !resumeSettled && session.request.resumePositionMillis > 0L -> session.request.resumePositionMillis
+            mediaWasSeekable -> lastNativePosition.coerceAtLeast(0L)
+            else -> 0L
+        }
+        logVlc("Playback recovery generation=${session.request.generation} reason=$reason position=$resume")
+        when (session.recoverPlayback(activeSourcesList, resume, desiredPaused)) {
+            PlaybackRecovery.RELOADED -> playbackNotice = "Playback stalled. Reloading this source..."
+            PlaybackRecovery.SWITCHED_SOURCE -> playbackNotice = "Playback stalled again. Trying the next source..."
+            PlaybackRecovery.EXHAUSTED -> {
+                vlcError = "Playback stopped responding. Select a source to retry."
+                isBuffering = false
+                isPlaying = false
+                showControls = true
+                activeProxyUrl.getAndSet(null)?.let(DesktopStreamProxy::releaseProxiedUrl)
+                try { player?.controls()?.stop() } catch (_: Exception) {}
+            }
+            PlaybackRecovery.IGNORED -> Unit
+        }
+    }
 
     // ── TV Series Episode Switching Function ─────────────────────────────────
     fun playEpisode(ep: Episode) {
-        if (isExtractingNextEp) return
         val targetApiName = apiName.ifBlank { loadResponse?.apiName ?: "" }
         val api = DesktopPluginLoader.getApiByName(targetApiName) ?: return
 
+        if (!session.beginEpisode()) return
+        val previousError = vlcError
+        lastConfirmedProgress?.let(DesktopDataStore::saveWatchProgress)
+        try { player?.controls()?.setPause(true) } catch (_: Exception) {}
         coroutineScope.launch {
-            isExtractingNextEp = true
             vlcError = null
             isBuffering = true
-            currentPosition = 0L
+            var switched = false
             try {
                 val links = mutableListOf<ExtractorLink>()
                 val subs = mutableListOf<SubtitleTrackInfo>()
@@ -306,7 +490,6 @@ fun PlayerScreen(
                 }
                 val sortedLinks = links.sortedByDescending { rankLink(it) }
                 if (sortedLinks.isNotEmpty()) {
-                    val best = sortedLinks.first()
                     currentEp = ep
                     val epCode = "S${ep.season ?: 1}E${ep.episode ?: 1}"
                     val epNameStr = ep.name
@@ -317,209 +500,147 @@ fun PlayerScreen(
                     } else {
                         epCode
                     }
-                    val newSources = sortedLinks.map { StreamSourceInfo(name = it.name, url = it.url, quality = it.quality, headers = it.headers) }
+                    val newSources = sortedLinks.map { StreamSourceInfo(name = it.name, url = it.url, quality = it.quality, headers = it.getAllHeaders()) }
                     activeSourcesList = newSources
                     activeSubtitlesList = subs
-                    selectedSubtitle = subs.firstOrNull()
-                    activeSource = StreamSourceInfo(name = best.name, url = best.url, quality = best.quality, headers = best.headers)
+                    desiredSubtitle = subs.firstOrNull()
+                    session.startEpisode(newSources.first())
+                    switched = true
                 } else {
-                    vlcError = "No playable links found for ${ep.name ?: "Episode ${ep.episode}"}"
+                    playbackNotice = "No playable links found for ${ep.name ?: "Episode ${ep.episode}"}"
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                vlcError = "Episode load failed: ${e.localizedMessage}"
+                playbackNotice = "Episode load failed: ${e.localizedMessage}"
             } finally {
-                isExtractingNextEp = false
+                session.finishEpisodeLoad()
+                isBuffering = false
+                if (!switched) {
+                    vlcError = previousError
+                    if (!disposed.get() && previousError == null) {
+                        try { player?.controls()?.setPause(desiredPaused) } catch (_: Exception) {}
+                    }
+                }
             }
         }
     }
 
-    // ── Native Decoded Tracks ──────────────────────────────────────────────────
-    var audioTracks by remember { mutableStateOf<List<TrackDescription>>(emptyList()) }
-    var nativeSubTracks by remember { mutableStateOf<List<TrackDescription>>(emptyList()) }
-    var selectedAudioTrackId by remember { mutableStateOf<Int?>(null) }
-    var selectedSubTrackId by remember { mutableStateOf<Int?>(null) }
-
-    // ── Zero-GC Pooled Frame Buffer & Lock-free Frame Ticker ─────────────────
-    class RawFrameData(val pixels: IntArray, val width: Int, val height: Int)
-    val arrayPool = remember { java.util.concurrent.ConcurrentLinkedQueue<IntArray>() }
-
-    fun obtainPixelArray(size: Int): IntArray {
-        val existing = arrayPool.poll()
-        return if (existing != null && existing.size >= size) existing else IntArray(size)
-    }
-
-    fun recyclePixelArray(arr: IntArray) {
-        if (arrayPool.size < 8) arrayPool.offer(arr)
-    }
-
-    val pendingRawFrame = remember { java.util.concurrent.atomic.AtomicReference<RawFrameData?>(null) }
-    val frameBuffer = remember {
-        object {
-            var bufferedImage: BufferedImage? = null
-            var w = 0; var h = 0
-            fun getOrCreate(width: Int, height: Int): BufferedImage {
-                if (bufferedImage == null || w != width || h != height) {
-                    w = width; h = height
-                    bufferedImage = BufferedImage(width, height, BufferedImage.TYPE_INT_RGB)
-                }
-                return bufferedImage!!
-            }
-        }
-    }
-
-    // 60fps Frame Ticker — zero-alloc transfer of raw pixels to Compose ImageBitmap
-    LaunchedEffect(Unit) {
-        while (isActive) {
-            val raw = pendingRawFrame.getAndSet(null)
-            if (raw != null) {
-                try {
-                    val image = frameBuffer.getOrCreate(raw.width, raw.height)
-                    val target = (image.raster.dataBuffer as DataBufferInt).data
-                    System.arraycopy(raw.pixels, 0, target, 0, raw.pixels.size.coerceAtMost(target.size))
-                    videoFrame = image.toComposeImageBitmap()
-                    isVideoReady = true
-                    if (isBuffering) isBuffering = false
-                } catch (_: Exception) {
-                } finally {
-                    recyclePixelArray(raw.pixels)
-                }
-            }
-            delay(16)
-        }
-    }
-
-    // ── VLC Setup (Created ONCE for lifetime of PlayerScreen) ───────────────────
-    val factoryAndPlayer = remember {
-        val vlcPath = tryConfigureVlc() ?: run {
-            vlcError = "VLC not found. Install from videolan.org"
-            return@remember null
-        }
-        try {
-            val args = buildList {
-                add("--quiet")
-                add("--no-video-title-show")
-                add("--avcodec-threads=0")       // Auto multi-threaded CPU decoding
-                add("--network-caching=2500")    // Optimized 2.5s network buffer for fast stream start
-                add("--file-caching=2500")       // 2.5s file buffer
-                add("--live-caching=2500")
-                add("--http-reconnect")
-                add("--clock-jitter=0")
-                add("--clock-synchro=0")
-                add("--no-stats")
-            }
-            val factory = MediaPlayerFactory(*args.toTypedArray())
-            val player = factory.mediaPlayers().newEmbeddedMediaPlayer()
-
-            val bufferFmt = object : BufferFormatCallback {
-                override fun getBufferFormat(width: Int, height: Int): BufferFormat {
-                    // Cap max pixel buffer to 1920x1080 for 4K streams (prevents memory copy bottleneck)
-                    val targetW = if (width > 1920) 1920 else width
-                    val targetH = if (width > 1920) (height * 1920) / width else height
-                    return RV32BufferFormat(targetW, targetH)
-                }
-                override fun allocatedBuffers(buffers: Array<ByteBuffer>) {}
-            }
-
-            val render = object : RenderCallback {
-                override fun display(
-                    mp: MediaPlayer,
-                    nativeBuffers: Array<out ByteBuffer>,
-                    fmt: uk.co.caprica.vlcj.player.embedded.videosurface.callback.BufferFormat
-                ) {
-                    try {
-                        val fw = fmt.width; val fh = fmt.height
-                        if (fw <= 0 || fh <= 0) return
-                        val buffer = nativeBuffers.firstOrNull() ?: return
-                        buffer.rewind()
-                        val ints = buffer.asIntBuffer()
-                        val count = (fw * fh).coerceAtMost(ints.remaining())
-                        if (count > 0) {
-                            val pixels = obtainPixelArray(count)
-                            ints.get(pixels, 0, count)
-                            val oldFrame = pendingRawFrame.getAndSet(RawFrameData(pixels, fw, fh))
-                            if (oldFrame != null) {
-                                recyclePixelArray(oldFrame.pixels)
-                            }
-                        }
-                    } catch (_: Exception) {}
-                }
-            }
-
-            val surface = factory.videoSurfaces().newVideoSurface(bufferFmt, render, true)
-            player.videoSurface().set(surface)
-
-            player.events().addMediaPlayerEventListener(object : uk.co.caprica.vlcj.player.base.MediaPlayerEventAdapter() {
-                override fun error(mp: MediaPlayer) {
-                    logVlc("LibVLC error while playing: ${toVlcMrl(activeSource.url)}")
-                    javax.swing.SwingUtilities.invokeLater {
-                        // 🔄 Auto-Failover: try next backup server automatically
-                        val currentIdx = sources.indexOf(activeSource)
-                        val nextSource = sources.getOrNull(currentIdx + 1)
-                        if (nextSource != null) {
-                            logVlc("Auto-failover to next server: ${nextSource.name}")
-                            activeSource = nextSource
-                        } else {
-                            vlcError = "VLC playback error — all servers failed"
-                        }
-                    }
-                }
-                override fun buffering(mp: MediaPlayer, newCache: Float) {
-                    javax.swing.SwingUtilities.invokeLater {
-                        if (newCache >= 100f) {
-                            isBuffering = false
-                        } else if (!mp.status().isPlaying) {
-                            isBuffering = true
-                        }
-                    }
-                }
-                override fun playing(mp: MediaPlayer) {
-                    javax.swing.SwingUtilities.invokeLater {
-                        isBuffering = false
-                        isPlaying = true
-                        isVideoReady = true
-                    }
-                }
-                override fun paused(mp: MediaPlayer) {
-                    javax.swing.SwingUtilities.invokeLater {
-                        isPlaying = false
-                    }
-                }
-                override fun stopped(mp: MediaPlayer) {
-                    javax.swing.SwingUtilities.invokeLater {
-                        isVideoReady = false
-                        isPlaying = false
-                    }
-                }
-            })
-
-            Pair(factory, player)
-        } catch (e: Exception) {
-            vlcError = e.message ?: "Failed to initialize VLC"
-            null
-        }
-    }
-
-    val player = factoryAndPlayer?.second
 
     // ── Smooth Server / Source Switching with Seamless Position Resume ──────────
-    LaunchedEffect(activeSource.url) {
-        if (player != null) {
-            val savedPos = currentPosition // Preserves timestamp across source server switches
-            vlcError = null
-            videoFrame = null
-            isVideoReady = false
-            pendingRawFrame.set(null)
-            isBuffering = true
-            isPlaying = true
+    LaunchedEffect(player, playbackRequest.generation) {
+        if (player == null) return@LaunchedEffect
+        val request = playbackRequest
+        fun ownsRequest() = !disposed.get() && session.request.generation == request.generation
+        fun isCurrent() = ownsRequest() && !session.loadingEpisode
+        fun post(action: () -> Unit) {
+            javax.swing.SwingUtilities.invokeLater { if (isCurrent() && vlcError == null) action() }
+        }
+        var failed = false
+        fun failSource(message: String) {
+            if (!isCurrent() || failed) return
+            failed = true
+            if (!session.failover(activeSourcesList, if (resumeSettled) currentPosition else request.resumePositionMillis, desiredPaused)) {
+                vlcError = message
+                isBuffering = false
+                isPlaying = false
+                activeProxyUrl.getAndSet(null)?.let(DesktopStreamProxy::releaseProxiedUrl)
+                try { player.controls().stop() } catch (_: Exception) {}
+            }
+        }
 
-            val rawUrl = activeSource.url
-            val headers = activeSource.headers
+        if (!ownsRequest()) return@LaunchedEffect
+        activeProxyUrl.getAndSet(null)?.let(DesktopStreamProxy::releaseProxiedUrl)
+        frameGeneration.set(-1)
+        player.controls().stop()
+        pendingRawFrame.getAndSet(null)?.let { recyclePixelArray(it.pixels) }
+        vlcError = null
+        videoFrame = null
+        isVideoReady = false
+        isSeekable = false
+        isBuffering = true
+        isPlaying = false
+        desiredPaused = request.paused
+        currentPosition = request.resumePositionMillis
+        totalDuration = 0L
+        lastPositionFraction = Float.NaN
+        lastNativePosition = -1L
+        initialProgressObserved = false
+        interruptedGeneration = null
+        mediaWasSeekable = false
+        bufferPercent = 0f
+        presentedFrames.set(0)
+        stallDetector.reset()
+        resumeSettled = false
+        pendingResumeGeneration = request.generation
+        audioTracks = emptyList()
+        nativeSubTracks = emptyList()
+        selectedAudioTrackId = null
+        selectedSubTrackId = null
+        selectedSubtitle = null
+        subtitleStatus = null
+        subtitleReloadRequired = false
+        externalSubtitleIds.clear()
+
+        val listener = object : uk.co.caprica.vlcj.player.base.MediaPlayerEventAdapter() {
+            override fun error(mp: MediaPlayer) = post { failSource("VLC playback error - all servers failed") }
+            override fun buffering(mp: MediaPlayer, newCache: Float) = post {
+                bufferPercent = newCache
+                isBuffering = newCache < 100f && !desiredPaused
+            }
+            override fun playing(mp: MediaPlayer) = post {
+                frameGeneration.set(request.generation)
+                isVideoReady = true
+                isBuffering = false
+                isPlaying = true
+                if (desiredPaused) mp.controls().setPause(true)
+            }
+            override fun paused(mp: MediaPlayer) = post { isPlaying = false; isBuffering = false }
+            override fun stopped(mp: MediaPlayer) = post { isPlaying = false }
+            override fun finished(mp: MediaPlayer) = post {
+                if (!initialProgressObserved && presentedFrames.get() == 0L) {
+                    val finalStatistics = MediaStatistics()
+                    val hadOutput = runCatching {
+                        mp.media().isValid && mp.media().info().statistics(finalStatistics) &&
+                            (finalStatistics.picturesDisplayed() > 0 || finalStatistics.audioBuffersPlayed() > 0)
+                    }.getOrDefault(false)
+                    if (!hadOutput) {
+                        interruptedGeneration = request.generation
+                        isPlaying = false
+                        isBuffering = false
+                        if (desiredPaused) playbackNotice = "Stream interrupted. Press Play to reconnect."
+                        else failSource("Stream ended before playback started")
+                        return@post
+                    }
+                }
+                if (isPrematureCompletion(lastNativePosition, totalDuration, lastPositionFraction, mediaWasSeekable)) {
+                    interruptedGeneration = request.generation
+                    isPlaying = false
+                    isBuffering = false
+                    if (desiredPaused) playbackNotice = "Stream interrupted. Press Play to reconnect."
+                    else recoverPlayback("premature completion")
+                    return@post
+                }
+                desiredPaused = true
+                isPlaying = false
+                isBuffering = false
+                completedGeneration = request.generation
+            }
+        }
+        player.events().addMediaPlayerEventListener(listener)
+        var proxiedUrl: String? = null
+        try {
+            val rawUrl = request.source.url
+            val headers = request.source.headers
 
             // Streams with headers (like Referer/User-Agent/Cookies), DASH (.mpd), or special streams
             // MUST route through DesktopStreamProxy so every sub-segment (.ts/.m4s) carries the required headers.
             val needsProxy = headers.isNotEmpty() || rawUrl.contains(".mpd", ignoreCase = true) || rawUrl.contains(".m3u8", ignoreCase = true) || rawUrl.contains("hakunaymatata", ignoreCase = true)
             val playUrl = if (needsProxy) {
-                com.lagradost.cloudstream.desktop.utils.DesktopStreamProxy.getProxiedUrl(rawUrl, headers)
+                DesktopStreamProxy.getProxiedUrl(rawUrl, headers).also {
+                    proxiedUrl = it
+                    activeProxyUrl.set(it)
+                }
             } else {
                 toVlcMrl(rawUrl)
             }
@@ -550,110 +671,249 @@ fun PlayerScreen(
                 add(":file-caching=1000")
                 add(":live-caching=3000")
                 add(":http-reconnect=1")
-                add(":clock-jitter=0")
-                add(":clock-synchro=0")
                 if (rawUrl.contains(".mpd", ignoreCase = true) || playUrl.contains(".mpd", ignoreCase = true)) {
                     add(":demux=adaptive")
                 }
             }.toTypedArray()
 
-            try {
-                logVlc("Starting LibVLC MRL: $playUrl (Resuming pos: ${savedPos}ms)")
-                player.media().play(playUrl, *opts)
-                if (savedPos > 1000L) {
-                    launch {
-                        for (attempt in 1..10) {
-                            delay(350)
-                            try {
-                                if (player.status().isPlaying || player.status().length() > 0) {
-                                    player.controls().setTime(savedPos)
-                                    currentPosition = savedPos
-                                    break
-                                }
-                            } catch (_: Exception) {}
+            // Keep callbacks and delayed work owned by this media request until it is replaced.
+            logVlc("Starting playback generation ${request.generation}, resume ${request.resumePositionMillis}ms")
+            if (!player.media().play(playUrl, *opts)) {
+                failSource("VLC could not open this stream - all servers failed")
+            }
+            launch {
+                try {
+                    while (isActive && ownsRequest() && vlcError == null && (!isVideoReady || session.loadingEpisode)) delay(100)
+                    if (!ownsRequest() || vlcError != null) return@launch
+                    player.audio().setVolume(volume)
+                    player.audio().isMute = isMuted
+                    player.controls().setRate(playbackSpeed)
+                    var issuedResumeTarget: Long? = null
+                    repeat(100) {
+                        while (isActive && ownsRequest() && session.loadingEpisode) delay(100)
+                        if (!ownsRequest() || vlcError != null || pendingResumeGeneration != request.generation) return@launch
+                        if (request.resumePositionMillis == 0L ||
+                            (issuedResumeTarget?.let { resumePositionConfirmed(it, player.status().time()) } == true)) {
+                            pendingResumeGeneration = null
+                            resumeSettled = true
+                            player.controls().setPause(desiredPaused)
+                            return@launch
                         }
+                        if (issuedResumeTarget == null) {
+                            val target = resumeTarget(request.resumePositionMillis, player.status().length(), player.status().isSeekable)
+                            if (target != null) {
+                                player.controls().setTime(target)
+                                currentPosition = target
+                                issuedResumeTarget = target
+                            }
+                        }
+                        delay(100)
+                    }
+                    if (isCurrent() && pendingResumeGeneration == request.generation) {
+                        pendingResumeGeneration = null
+                        playbackNotice = "Saved position could not be restored. Previous progress was kept."
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    if (isCurrent()) {
+                        pendingResumeGeneration = null
+                        playbackNotice = "Could not restore playback settings. Previous progress was kept."
                     }
                 }
-            } catch (e: Exception) {
-                vlcError = "Failed to switch source: ${e.message}"
-                isBuffering = false
             }
+            launch {
+                // Native playing can precede the first output; intentional pauses suspend this startup deadline.
+                var activeSince = System.nanoTime()
+                while (isActive && ownsRequest() && vlcError == null && !initialProgressObserved && presentedFrames.get() == 0L) {
+                    delay(500)
+                    if (!ownsRequest() || vlcError != null || initialProgressObserved || presentedFrames.get() > 0L) return@launch
+                    val now = System.nanoTime()
+                    if (desiredPaused || session.loadingEpisode) activeSince = now
+                    else if (now - activeSince >= 30_000_000_000L) {
+                        failSource("Stream timed out - all servers failed")
+                        return@launch
+                    }
+                }
+            }
+            awaitCancellation()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            failSource("Failed to switch source: ${e.message}")
+        } finally {
+            proxiedUrl?.let {
+                DesktopStreamProxy.releaseProxiedUrl(it)
+                activeProxyUrl.compareAndSet(it, null)
+            }
+            if (!disposed.get()) player.events().removeMediaPlayerEventListener(listener)
         }
     }
 
-    // ── Polling & Track Sync ───────────────────────────────────────────────────
-    LaunchedEffect(player, currentEpIndex, hasNextEpisode, isExtractingNextEp) {
+    // Polling & Track Sync. Never label outgoing media with a new episode or save an unsettled resume.
+    LaunchedEffect(player, playbackRequest.generation) {
+        if (player == null) return@LaunchedEffect
+        val generation = playbackRequest.generation
+        val statistics = MediaStatistics()
+        var lastSavedAt = 0L
+        var lastDiagnosticAt = 0L
+        var startupNativeTime: Long? = null
         while (isActive) {
             delay(500)
+            if (disposed.get() || session.request.generation != generation || session.loadingEpisode || !isVideoReady || vlcError != null) {
+                stallDetector.reset()
+                continue
+            }
             try {
-                val dur = player?.status()?.length() ?: 0L
-                val pos = player?.status()?.time() ?: 0L
-                if (dur > 0) { totalDuration = dur; currentPosition = pos }
-
-                // Periodic Watch Progress save (every ~5 seconds)
-                if (pos > 3000L && dur > 10_000L && (pos % 5000L < 600L)) {
-                    val resolvedPoster = posterUrl ?: loadResponse?.posterUrl
-                    val epObj = currentEp ?: (if (currentEpIndex != -1) allEpisodes.getOrNull(currentEpIndex) else null) ?: currentEpisode
-                    DesktopDataStore.saveWatchProgress(
-                        WatchProgress(
-                            title = title + (activeEpisodeName?.let { if (it.isNotBlank()) " — $it" else "" } ?: ""),
-                            url = loadResponse?.url ?: activeSource.url,
-                            posterUrl = resolvedPoster,
-                            positionMillis = pos,
-                            durationMillis = dur,
-                            episodeIndex = epObj?.episode,
-                            seasonIndex = epObj?.season,
-                            apiName = loadResponse?.apiName ?: apiName
-                        )
-                    )
-                }
-
-                // Auto-Play Next Episode when current episode is finished
-                if (dur > 30_000L && pos > 0 && (dur - pos) < 2500L && hasNextEpisode && !isExtractingNextEp) {
-                    if (currentEpIndex != -1 && currentEpIndex < allEpisodes.size - 1) {
-                        playEpisode(allEpisodes[currentEpIndex + 1])
+                val nativeState = player.status().state()
+                val readable = nativeState == State.PLAYING || nativeState == State.BUFFERING || nativeState == State.PAUSED
+                val duration = player.status().length().coerceAtLeast(0L)
+                val position = player.status().time()
+                val nativeSeekable = player.status().isSeekable
+                isSeekable = readable && nativeSeekable && totalDuration > 0L
+                if (readable) {
+                    if (pendingResumeGeneration == null && position >= 0L) {
+                        if (startupNativeTime?.let { position > it } == true) initialProgressObserved = true
+                        startupNativeTime = position
+                    } else startupNativeTime = null
+                    if (position >= 0L) lastNativePosition = position
+                    if (duration > 0L) totalDuration = duration
+                    if (nativeSeekable) mediaWasSeekable = true
+                    val fraction = player.status().position()
+                    if (fraction.isFinite() && fraction in 0f..1f) lastPositionFraction = fraction
+                    if (position >= 0L && (isPlaying || desiredPaused)) {
+                        currentPosition = position
+                        if (resumeSettled && duration > 0L) {
+                            val epObj = currentEp ?: allEpisodes.getOrNull(currentEpIndex) ?: currentEpisode
+                            val progress = WatchProgress(
+                                title = title + (activeEpisodeName?.takeIf { it.isNotBlank() }?.let { " \u2014 $it" } ?: ""),
+                                url = loadResponse?.url ?: session.request.source.url,
+                                posterUrl = posterUrl ?: loadResponse?.posterUrl,
+                                positionMillis = position,
+                                durationMillis = duration,
+                                episodeIndex = epObj?.episode,
+                                seasonIndex = epObj?.season,
+                                apiName = loadResponse?.apiName ?: apiName
+                            )
+                            lastConfirmedProgress = progress
+                            val now = System.nanoTime() / 1_000_000L
+                            if (position > 3000L && now - lastSavedAt >= 5000L) {
+                                DesktopDataStore.saveWatchProgress(progress)
+                                lastSavedAt = now
+                            }
+                        }
                     }
                 }
+                audioTracks = player.audio().trackDescriptions()
+                selectedAudioTrackId = player.audio().track()
+                nativeSubTracks = player.subpictures().trackDescriptions()
+                selectedSubTrackId = player.subpictures().track()
+                if (selectedSubtitle != null && externalSubtitleIds[selectedSubtitle?.url] != selectedSubTrackId) selectedSubtitle = null
 
-                // Fetch live decoded audio and subtitle track descriptions
-                val audioDescs = player?.audio()?.trackDescriptions() ?: emptyList()
-                if (audioDescs.size > 1 && audioTracks != audioDescs) {
-                    audioTracks = audioDescs
-                    if (selectedAudioTrackId == null) {
-                        selectedAudioTrackId = player?.audio()?.track()
-                    }
+                val videoEnabled = player.video().track() >= 0
+                val audioEnabled = selectedAudioTrackId?.let { it >= 0 } == true
+                val statsAvailable = player.media().isValid && player.media().info().statistics(statistics)
+                if (presentedFrames.get() > 0L || (statsAvailable &&
+                    (statistics.picturesDisplayed() > 0 || statistics.audioBuffersPlayed() > 0))) initialProgressObserved = true
+                val now = System.nanoTime() / 1_000_000L
+                val stalled = stallDetector.sample(
+                    nowMillis = now,
+                    positionMillis = lastNativePosition,
+                    videoPictures = if (statsAvailable && videoEnabled) statistics.picturesDisplayed() else null,
+                    audioBuffers = if (statsAvailable && audioEnabled) statistics.audioBuffersPlayed() else null,
+                    presentedVideoFrames = if (videoEnabled) presentedFrames.get() else null,
+                    active = pendingResumeGeneration == null && !desiredPaused && completedGeneration != generation
+                )
+                if (stalled != null) {
+                    recoverPlayback("${stalled.name.lowercase()} stopped progressing for 45s")
+                    continue
                 }
-
-                val subDescs = player?.subpictures()?.trackDescriptions() ?: emptyList()
-                if (subDescs.size > 1 && nativeSubTracks != subDescs) {
-                    nativeSubTracks = subDescs
-                    if (selectedSubTrackId == null) {
-                        selectedSubTrackId = player?.subpictures()?.track()
-                    }
+                if (!desiredPaused && now - lastDiagnosticAt >= 10_000L) {
+                    lastDiagnosticAt = now
+                    val diagnostic = "Playback progress generation=$generation time=$currentPosition duration=$totalDuration " +
+                        "state=$nativeState cache=$bufferPercent stats=$statsAvailable " +
+                        "video=${statistics.picturesDisplayed()} audio=${statistics.audioBuffersPlayed()} published=${presentedFrames.get()}"
+                    withContext(Dispatchers.IO) { logVlc(diagnostic) }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {}
         }
     }
 
-    // 30-second timeout with auto-failover to next backup server
-    LaunchedEffect(activeSource.url) {
-        delay(30_000)
-        if (!isVideoReady && vlcError == null) {
-            // 🔄 Auto-Failover on timeout: try the next source before showing error
-            val currentIdx = sources.indexOf(activeSource)
-            val nextSource = sources.getOrNull(currentIdx + 1)
-            if (nextSource != null) {
-                logVlc("Timeout auto-failover to: ${nextSource.name}")
-                activeSource = nextSource
-            } else {
-                vlcError = "Stream timed out — server may be slow or URL unavailable"
+    // Auto-Play Next Episode only after VLC reports the current media finished, once per request.
+    LaunchedEffect(completedGeneration) {
+        val generation = completedGeneration ?: return@LaunchedEffect
+        if (session.consumeCompletion(generation) && hasNextEpisode) {
+            playEpisode(allEpisodes[currentEpIndex + 1])
+        }
+    }
+
+    LaunchedEffect(player, playbackRequest.generation, isVideoReady) {
+        if (player == null || !isVideoReady) return@LaunchedEffect
+        val generation = playbackRequest.generation
+        fun isCurrent() = !disposed.get() && session.request.generation == generation
+        var handledRequest = -1
+        while (isActive && isCurrent()) {
+            if (session.loadingEpisode || handledRequest == subtitleRequestNumber || desiredSubtitle == null) {
+                delay(100)
+                continue
+            }
+            if (subtitleReloadRequired) {
+                session.restartSource(if (resumeSettled) currentPosition else playbackRequest.resumePositionMillis, desiredPaused)
+                return@LaunchedEffect
+            }
+            val operation = subtitleRequestNumber
+            val sub = desiredSubtitle ?: continue
+            handledRequest = operation
+            subtitleStatus = "Loading ${sub.language}..."
+            try {
+                var id = externalSubtitleIds[sub.url]
+                if (id == null) {
+                    val file = externalSubtitleFiles[sub.url] ?: withContext(Dispatchers.IO) {
+                        cacheSubtitle(sub.url, subtitleDirectory)
+                    }.also { externalSubtitleFiles[sub.url] = it }
+                    if (!isCurrent() || operation != subtitleRequestNumber || desiredSubtitle != sub) continue
+                    val before = player.subpictures().trackDescriptions().map { it.id() }.toSet()
+                    if (!player.media().addSlave(uk.co.caprica.vlcj.media.MediaSlaveType.SUBTITLE, file.toPath().toUri().toASCIIString(), false)) {
+                        subtitleStatus = "Could not load subtitle. Try another track."
+                        continue
+                    }
+                    var attempts = 0
+                    while (id == null && attempts++ < 40) {
+                        delay(200)
+                        if (!isCurrent()) return@LaunchedEffect
+                        val added = player.subpictures().trackDescriptions().filter { it.id() >= 0 && it.id() !in before }
+                        if (added.size == 1) id = added.single().id()
+                        else if (added.size > 1) break
+                    }
+                    if (!isCurrent()) return@LaunchedEffect
+                    if (id != null) externalSubtitleIds[sub.url] = id!!
+                    else {
+                        // VLC exposes no request ID; reset this media before another addition can claim a late track.
+                        subtitleReloadRequired = true
+                        if (operation == subtitleRequestNumber) subtitleStatus = "Subtitle did not become available. Try another track."
+                    }
+                }
+                if (id != null && operation == subtitleRequestNumber && desiredSubtitle == sub && !session.loadingEpisode) {
+                    player.subpictures().setTrack(id)
+                    selectedSubTrackId = player.subpictures().track()
+                    if (selectedSubTrackId == id) {
+                        selectedSubtitle = sub
+                        subtitleStatus = null
+                    } else subtitleStatus = "Subtitle selection was not accepted. Try again."
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                if (isCurrent() && operation == subtitleRequestNumber) subtitleStatus = "Could not load subtitle. Try another track."
             }
         }
     }
 
     // Auto-hide controls after 4s
-    LaunchedEffect(showControls, isLocked) {
-        if (showControls && isVideoReady && !isLocked) {
+    LaunchedEffect(showControls, isLocked, isVideoReady, isPlaying, controlsInteraction) {
+        if (showControls && isVideoReady && isPlaying && !isLocked) {
             delay(4000)
             showControls = false
         }
@@ -670,47 +930,51 @@ fun PlayerScreen(
     // ── Cleanup / Save progress on screen exit ────────────────────────────────
     DisposableEffect(Unit) {
         onDispose {
+            disposed.set(true)
+            frameGeneration.set(-1)
+            activeProxyUrl.getAndSet(null)?.let(DesktopStreamProxy::releaseProxiedUrl)
             try {
                 player?.controls()?.stop()
                 player?.release()
                 factoryAndPlayer?.first?.release()
             } catch (_: Exception) {}
-            val resolvedPoster = posterUrl ?: loadResponse?.posterUrl
-            val epObj = currentEp ?: (if (currentEpIndex != -1) allEpisodes.getOrNull(currentEpIndex) else null) ?: currentEpisode
-            DesktopDataStore.saveWatchProgress(
-                WatchProgress(
-                    title = title + (activeEpisodeName?.let { if (it.isNotBlank()) " — $it" else "" } ?: (episodeName?.let { " — $it" } ?: "")),
-                    url = loadResponse?.url ?: activeSource.url,
-                    posterUrl = resolvedPoster,
-                    positionMillis = currentPosition,
-                    durationMillis = totalDuration,
-                    episodeIndex = epObj?.episode,
-                    seasonIndex = epObj?.season,
-                    apiName = loadResponse?.apiName ?: apiName
-                )
-            )
+            lastConfirmedProgress?.let(DesktopDataStore::saveWatchProgress)
+            subtitleDirectory.listFiles()?.forEach { it.delete() }
+            subtitleDirectory.delete()
         }
     }
 
     // ── Helper lambdas ────────────────────────────────────────────────────────
     fun seekBy(ms: Long) {
+        if (isLocked || session.loadingEpisode) return
         try {
-            val newPos = (currentPosition + ms).coerceIn(0, totalDuration)
-            player?.controls()?.setTime(newPos)
-            currentPosition = newPos
-            seekIndicator = if (ms > 0) "+${ms / 1000}s" else "${ms / 1000}s"
+            val target = seekTarget(currentPosition, totalDuration, player?.status()?.isSeekable == true, ms) ?: return
+            val delta = target - currentPosition
+            if (delta == 0L) return
+            pendingResumeGeneration = null
+            resumeSettled = true
+            stallDetector.reset()
+            player?.controls()?.setTime(target)
+            currentPosition = target
+            seekIndicator = seekIndicator(delta).takeIf { it.isNotEmpty() }
         } catch (_: Exception) {}
     }
 
     fun togglePlayPause() {
-        if (player != null) {
-            val nextState = !isPlaying
-            isPlaying = nextState
-            try {
-                if (nextState) player.controls().play()
-                else player.controls().pause()
-            } catch (_: Exception) {}
+        if (player == null || isLocked || session.loadingEpisode) return
+        if (interruptedGeneration == session.request.generation) {
+            desiredPaused = false
+            recoverPlayback("interrupted source resumed")
+            return
         }
+        if (completedGeneration == session.request.generation) {
+            session.resetRecovery()
+            session.restartSource(0L, false)
+            return
+        }
+        desiredPaused = !desiredPaused
+        stallDetector.reset()
+        try { player.controls().setPause(desiredPaused) } catch (_: Exception) {}
     }
 
     fun setVolume(v: Int) {
@@ -719,18 +983,29 @@ fun PlayerScreen(
     }
 
     fun setSpeed(s: Float) {
+        stallDetector.reset()
         playbackSpeed = s
         try { player?.controls()?.setRate(s) } catch (_: Exception) {}
     }
 
     fun selectAudioTrack(trackId: Int) {
-        selectedAudioTrackId = trackId
-        try { player?.audio()?.setTrack(trackId) } catch (_: Exception) {}
+        stallDetector.reset()
+        try {
+            player?.audio()?.setTrack(trackId)
+            selectedAudioTrackId = player?.audio()?.track()
+        } catch (_: Exception) {}
     }
 
     fun selectNativeSubTrack(trackId: Int) {
-        selectedSubTrackId = trackId
-        try { player?.subpictures()?.setTrack(trackId) } catch (_: Exception) {}
+        desiredSubtitle = null
+        subtitleRequestNumber++
+        subtitleStatus = null
+        try {
+            player?.subpictures()?.setTrack(trackId)
+            selectedSubTrackId = player?.subpictures()?.track()
+            if (selectedSubTrackId == trackId) selectedSubtitle = null
+            else subtitleStatus = "Subtitle selection was not accepted. Try again."
+        } catch (_: Exception) { subtitleStatus = "Could not select subtitle track." }
     }
 
     fun launchExternalVlc() {
@@ -755,9 +1030,17 @@ fun PlayerScreen(
     }
 
     val focusRequester = remember { FocusRequester() }
-
-    LaunchedEffect(Unit) {
-        focusRequester.requestFocus()
+    var escapePressed by remember { mutableStateOf(false) }
+    val toggleKeys = remember { ToggleKeyLatch<Key>() }
+    val windowInfo = LocalWindowInfo.current
+    LaunchedEffect(windowInfo.isWindowFocused) {
+        if (!windowInfo.isWindowFocused) { toggleKeys.clear(); escapePressed = false }
+    }
+    val drawerOpen = showEpisodesPicker || showSourcesPicker || showAudioTrackPicker || showSubtitlePicker || showSpeedPicker || showVolumePicker
+    LaunchedEffect(drawerOpen, isLocked) { onWindowShortcutsBlockedChange(drawerOpen || isLocked) }
+    LaunchedEffect(drawerOpen, isLocked, isFullscreen) {
+        toggleKeys.clear()
+        if (!drawerOpen) focusRequester.requestFocus()
     }
 
     // ── Render ────────────────────────────────────────────────────────────────
@@ -766,46 +1049,94 @@ fun PlayerScreen(
             .fillMaxSize()
             .background(Color.Black)
             .focusRequester(focusRequester)
-            .focusable()
-            .onPreviewKeyEvent { event ->
-                if (event.type == KeyEventType.KeyDown) {
-                    when (event.key) {
-                        Key.F, Key.F11 -> { onToggleFullscreen(); true }
-                        Key.Escape -> {
-                            if (isFullscreen) { onToggleFullscreen(); true }
-                            else { onBack(); true }
-                        }
-                        Key.Backspace -> { onBack(); true }
-                        Key.Spacebar, Key.K -> { togglePlayPause(); true }
-                        Key.DirectionRight, Key.L -> { seekBy(10_000L); true }
-                        Key.DirectionLeft, Key.J -> { seekBy(-10_000L); true }
-                        Key.DirectionUp -> {
-                            setVolume(volume + 10)
-                            true
-                        }
-                        Key.DirectionDown -> {
-                            setVolume(volume - 10)
-                            true
-                        }
-                        Key.M -> {
-                            isMuted = !isMuted
-                            try { player?.audio()?.isMute = isMuted } catch (_: Exception) {}
-                            true
-                        }
-                        else -> false
-                    }
-                } else false
+            .onFocusChanged {
+                if (!it.hasFocus) { toggleKeys.clear(); escapePressed = false }
             }
-            .pointerInput(Unit) {
+            .onPreviewKeyEvent { event ->
+                if (event.key != Key.Escape) false
+                else {
+                    if (event.type == KeyEventType.KeyDown) escapePressed = true
+                    if (event.type == KeyEventType.KeyUp && escapePressed) {
+                        escapePressed = false
+                        if (drawerOpen) {
+                            showEpisodesPicker = false
+                            showSourcesPicker = false
+                            showAudioTrackPicker = false
+                            showSubtitlePicker = false
+                            showSpeedPicker = false
+                            showVolumePicker = false
+                        } else if (isFullscreen) onToggleFullscreen()
+                        else onBack()
+                    }
+                    true
+                }
+            }
+            .onKeyEvent { event ->
+                if (event.isCtrlPressed || event.isAltPressed || event.isMetaPressed || drawerOpen) {
+                    toggleKeys.clear()
+                    false
+                } else if (event.key == Key.Backspace) {
+                    if (event.type == KeyEventType.KeyDown) toggleKeys.press(event.key)
+                    if (event.type == KeyEventType.KeyUp && toggleKeys.release(event.key)) onBack()
+                    true
+                } else if (isLocked) {
+                    toggleKeys.clear()
+                    false
+                } else when (event.key) {
+                    Key.Spacebar, Key.K, Key.M, Key.F, Key.F11 -> {
+                        if (event.type == KeyEventType.KeyDown) toggleKeys.press(event.key)
+                        if (event.type == KeyEventType.KeyUp && toggleKeys.release(event.key)) {
+                            controlsInteraction++
+                            showControls = true
+                            when (event.key) {
+                                Key.Spacebar, Key.K -> togglePlayPause()
+                                Key.M -> {
+                                    isMuted = !isMuted
+                                    try { player?.audio()?.isMute = isMuted } catch (_: Exception) {}
+                                }
+                                else -> onToggleFullscreen()
+                            }
+                        }
+                        true
+                    }
+                    Key.DirectionRight, Key.L, Key.DirectionLeft, Key.J, Key.DirectionUp, Key.DirectionDown -> {
+                        if (event.type == KeyEventType.KeyDown) {
+                            controlsInteraction++
+                            showControls = true
+                            when (event.key) {
+                                Key.DirectionRight, Key.L -> seekBy(10_000L)
+                                Key.DirectionLeft, Key.J -> seekBy(-10_000L)
+                                Key.DirectionUp -> setVolume(volume + 10)
+                                else -> setVolume(volume - 10)
+                            }
+                        }
+                        true
+                    }
+                    else -> false
+                }
+            }
+            .focusable()
+            .onPointerEvent(PointerEventType.Move) {
+                if (!isLocked) {
+                    showControls = true
+                    controlsInteraction++
+                }
+            }
+            .pointerInput(isLocked, isFullscreen) {
                 detectTapGestures(
                     onTap = {
                         focusRequester.requestFocus()
+                        controlsInteraction++
                         if (!isLocked) showControls = !showControls
                         else showControls = true
                     },
                     onDoubleTap = {
-                        focusRequester.requestFocus()
-                        onToggleFullscreen()
+                        if (!isLocked) {
+                            focusRequester.requestFocus()
+                            controlsInteraction++
+                            showControls = true
+                            onToggleFullscreen()
+                        }
                     }
                 )
             }
@@ -822,37 +1153,37 @@ fun PlayerScreen(
             isExtractingNextEp -> Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color(0xFF0F0F12)),
+                    .background(Color(0xFF121212)),
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     CircularProgressIndicator(
-                        color = MaterialTheme.colorScheme.primary,
+                        color = Color(0xFFE50914),
                         strokeWidth = 3.dp,
                         modifier = Modifier.size(44.dp)
                     )
                     Spacer(Modifier.height(18.dp))
                     Text("Fetching stream sources…", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
                     Spacer(Modifier.height(6.dp))
-                    Text("Connecting to provider link", color = Color.White.copy(0.5f), fontSize = 12.sp)
+                    Text("Connecting to provider link", color = Color(0xFFB0B0B0), fontSize = 12.sp)
                 }
             }
             videoFrame == null || !isVideoReady -> Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color(0xFF0D0D10)),
+                    .background(Color(0xFF121212)),
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     CircularProgressIndicator(
-                        color = MaterialTheme.colorScheme.primary,
+                        color = Color(0xFFE50914),
                         strokeWidth = 3.dp,
                         modifier = Modifier.size(44.dp)
                     )
                     Spacer(Modifier.height(18.dp))
                     Text("Connecting to ${activeSource.name}…", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
                     Spacer(Modifier.height(6.dp))
-                    Text("Buffering initial stream segments", color = Color.White.copy(0.5f), fontSize = 12.sp)
+                    Text("Buffering initial stream segments", color = Color(0xFFB0B0B0), fontSize = 12.sp)
                 }
             }
             else -> Image(
@@ -861,6 +1192,16 @@ fun PlayerScreen(
                 modifier = Modifier.fillMaxSize(),
                 contentScale = videoAspectMode.scale
             )
+        }
+
+        playbackNotice?.let { message ->
+            Surface(
+                color = VideoControlBackground,
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 70.dp, start = 24.dp, end = 24.dp)
+            ) {
+                Text(message, color = Color.White, modifier = Modifier.padding(12.dp))
+            }
         }
 
         // Seek indicator (centre flash)
@@ -884,7 +1225,11 @@ fun PlayerScreen(
         // Buffering spinner overlay
         if (isBuffering && videoFrame != null) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(color = Color.White, modifier = Modifier.size(48.dp), strokeWidth = 3.dp)
+                CircularProgressIndicator(
+                    color = Color.White,
+                    modifier = Modifier.size(48.dp).background(VideoControlBackground, CircleShape),
+                    strokeWidth = 3.dp
+                )
             }
         }
 
@@ -915,6 +1260,7 @@ fun PlayerScreen(
                     hasAudioTracks = audioTracks.isNotEmpty(),
                     hasSubtitles = activeSubtitlesList.isNotEmpty() || nativeSubTracks.isNotEmpty(),
                     hasVideo = videoFrame != null && isVideoReady && !isExtractingNextEp,
+                    canSeek = isSeekable,
                     isFullscreen = isFullscreen,
                     onToggleFullscreen = onToggleFullscreen,
                     videoAspectMode = videoAspectMode,
@@ -934,9 +1280,7 @@ fun PlayerScreen(
                     onPrevEpisode = { if (hasPrevEpisode) playEpisode(allEpisodes[currentEpIndex - 1]) },
                     onNextEpisode = { if (hasNextEpisode) playEpisode(allEpisodes[currentEpIndex + 1]) },
                     onSeek = { pct ->
-                        val seekTo = (pct * totalDuration).toLong()
-                        currentPosition = seekTo
-                        try { player?.controls()?.setTime(seekTo) } catch (_: Exception) {}
+                        seekBy((pct * totalDuration).toLong() - currentPosition)
                     },
                     onMuteToggle = {
                         isMuted = !isMuted
@@ -974,9 +1318,13 @@ fun PlayerScreen(
                 sources = activeSourcesList,
                 currentSource = activeSource,
                 onSelect = { src ->
-                    activeSource = src
-                    vlcError = null
-                    isVideoReady = false
+                    if (!session.loadingEpisode) {
+                        val position = if (resumeSettled) currentPosition else playbackRequest.resumePositionMillis
+                        if (vlcError != null && samePlaybackSource(src, activeSource)) {
+                            session.resetRecovery()
+                            session.restartSource(position, desiredPaused)
+                        } else if (session.selectSource(src, position, desiredPaused)) session.resetRecovery()
+                    }
                     showSourcesPicker = false
                 },
                 onDismiss = { showSourcesPicker = false }
@@ -995,9 +1343,11 @@ fun PlayerScreen(
             visible = showSubtitlePicker,
             externalSubtitles = activeSubtitlesList,
             selectedExternal = selectedSubtitle,
-            nativeTracks = nativeSubTracks,
+            nativeTracks = nativeSubTracks.filterNot { it.id() in externalSubtitleIds.values },
             selectedNativeId = selectedSubTrackId,
-            onSelectExternal = { sub -> selectedSubtitle = sub; showSubtitlePicker = false },
+            status = subtitleStatus,
+            onSelectExternal = { sub -> desiredSubtitle = sub; subtitleRequestNumber++ },
+            onDisable = { selectNativeSubTrack(-1) },
             onSelectNative = { id -> selectNativeSubTrack(id); showSubtitlePicker = false },
             onDismiss = { showSubtitlePicker = false }
         )
@@ -1043,6 +1393,7 @@ private fun PlayerControlsOverlay(
     hasAudioTracks: Boolean,
     hasSubtitles: Boolean,
     hasVideo: Boolean,
+    canSeek: Boolean,
     isFullscreen: Boolean,
     onToggleFullscreen: () -> Unit,
     videoAspectMode: VideoAspectMode,
@@ -1072,7 +1423,13 @@ private fun PlayerControlsOverlay(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(110.dp)
-                .background(Brush.verticalGradient(listOf(Color.Black.copy(0.85f), Color.Transparent)))
+                .background(
+                    Brush.verticalGradient(
+                        0f to Color.Black.copy(0.85f),
+                        0.55f to Color.Black.copy(0.8f),
+                        1f to Color.Transparent
+                    )
+                )
         )
         // Bottom gradient fade
         Box(
@@ -1080,7 +1437,13 @@ private fun PlayerControlsOverlay(
                 .fillMaxWidth()
                 .height(150.dp)
                 .align(Alignment.BottomCenter)
-                .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(0.90f))))
+                .background(
+                    Brush.verticalGradient(
+                        0f to Color.Transparent,
+                        0.4f to Color.Black.copy(0.65f),
+                        1f to Color.Black.copy(0.90f)
+                    )
+                )
         )
 
         // ── TOP BAR ──────────────────────────────────────────────────────────
@@ -1105,7 +1468,7 @@ private fun PlayerControlsOverlay(
                             Text(episodeName, color = Color.White.copy(0.7f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text("  •  ", color = Color.White.copy(0.4f), fontSize = 12.sp)
                         }
-                        Text(cleanServerTitle(activeSourceName), color = Color(0xFF0078D4), fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                        Text(cleanServerTitle(activeSourceName), color = Color(0xFFE50914), fontSize = 12.sp, fontWeight = FontWeight.Medium)
                     }
                 }
             }
@@ -1116,8 +1479,8 @@ private fun PlayerControlsOverlay(
                     Surface(
                         onClick = onEpisodesClick,
                         shape = RoundedCornerShape(6.dp),
-                        color = Color(0xFF2C2C2C),
-                        border = BorderStroke(1.dp, Color(0x18FFFFFF)),
+                        color = Color(0xFF252525),
+                        border = BorderStroke(1.dp, Color(0x1AFFFFFF)),
                         modifier = Modifier.height(32.dp)
                     ) {
                         Row(
@@ -1136,8 +1499,8 @@ private fun PlayerControlsOverlay(
                     Surface(
                         onClick = onSourcesClick,
                         shape = RoundedCornerShape(6.dp),
-                        color = Color(0xFF2C2C2C),
-                        border = BorderStroke(1.dp, Color(0x18FFFFFF)),
+                        color = Color(0xFF252525),
+                        border = BorderStroke(1.dp, Color(0x1AFFFFFF)),
                         modifier = Modifier.height(32.dp)
                     ) {
                         Row(
@@ -1153,7 +1516,7 @@ private fun PlayerControlsOverlay(
 
                 // Speed badge
                 if (playbackSpeed != 1.0f) {
-                    Surface(color = Color(0xFF0078D4), shape = RoundedCornerShape(4.dp)) {
+                    Surface(color = Color(0xFFE50914), shape = RoundedCornerShape(4.dp)) {
                         Text("${playbackSpeed}x", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                     }
                 }
@@ -1168,7 +1531,11 @@ private fun PlayerControlsOverlay(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (hasEpisodes) {
-                    IconButton(onClick = onPrevEpisode, enabled = hasPrevEpisode, modifier = Modifier.size(44.dp)) {
+                    IconButton(
+                        onClick = onPrevEpisode,
+                        enabled = hasPrevEpisode,
+                        modifier = Modifier.size(44.dp).background(VideoControlBackground, CircleShape)
+                    ) {
                         Icon(
                             Icons.Default.SkipPrevious, null,
                             tint = if (hasPrevEpisode) Color.White else Color.White.copy(0.3f),
@@ -1177,7 +1544,10 @@ private fun PlayerControlsOverlay(
                     }
                 }
 
-                IconButton(onClick = onSeekBack30, modifier = Modifier.size(48.dp)) {
+                IconButton(
+                    onClick = onSeekBack30,
+                    modifier = Modifier.size(48.dp).background(VideoControlBackground, CircleShape)
+                ) {
                     Icon(Icons.Default.Replay30, null, tint = Color.White, modifier = Modifier.size(30.dp))
                 }
 
@@ -1185,7 +1555,7 @@ private fun PlayerControlsOverlay(
                 Surface(
                     onClick = onPlayPause,
                     shape = CircleShape,
-                    color = Color.Black.copy(0.55f),
+                    color = VideoControlBackground,
                     border = BorderStroke(1.dp, Color.White.copy(0.3f)),
                     modifier = Modifier.size(64.dp)
                 ) {
@@ -1197,12 +1567,19 @@ private fun PlayerControlsOverlay(
                     }
                 }
 
-                IconButton(onClick = onSeekForward30, modifier = Modifier.size(48.dp)) {
+                IconButton(
+                    onClick = onSeekForward30,
+                    modifier = Modifier.size(48.dp).background(VideoControlBackground, CircleShape)
+                ) {
                     Icon(Icons.Default.Forward30, null, tint = Color.White, modifier = Modifier.size(30.dp))
                 }
 
                 if (hasEpisodes) {
-                    IconButton(onClick = onNextEpisode, enabled = hasNextEpisode, modifier = Modifier.size(44.dp)) {
+                    IconButton(
+                        onClick = onNextEpisode,
+                        enabled = hasNextEpisode,
+                        modifier = Modifier.size(44.dp).background(VideoControlBackground, CircleShape)
+                    ) {
                         Icon(
                             Icons.Default.SkipNext, null,
                             tint = if (hasNextEpisode) Color.White else Color.White.copy(0.3f),
@@ -1231,10 +1608,11 @@ private fun PlayerControlsOverlay(
                     Slider(
                         value = if (totalDuration > 0) (currentPosition.toFloat() / totalDuration).coerceIn(0f, 1f) else 0f,
                         onValueChange = onSeek,
+                        enabled = canSeek,
                         modifier = Modifier.weight(1f),
                         colors = SliderDefaults.colors(
                             thumbColor = Color.White,
-                            activeTrackColor = Color(0xFF0078D4),
+                            activeTrackColor = Color(0xFFE50914),
                             inactiveTrackColor = Color.White.copy(0.25f)
                         )
                     )
@@ -1395,8 +1773,8 @@ private fun RightSidebarDrawer(
                             interactionSource = remember { MutableInteractionSource() },
                             onClick = {}
                         ),
-                    color = Color(0xFF242424).copy(0.98f),
-                    border = BorderStroke(1.dp, Color(0x18FFFFFF))
+                    color = Color(0xFF1C1C1C).copy(0.98f),
+                    border = BorderStroke(1.dp, Color(0x1AFFFFFF))
                 ) {
                     Column(
                         modifier = Modifier
@@ -1435,7 +1813,7 @@ private fun SourcesPickerDialog(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                     Icons.Default.Dns, null,
-                    tint = Color(0xFF0078D4),
+                    tint = Color(0xFFE50914),
                     modifier = Modifier.size(20.dp)
                 )
                 Spacer(Modifier.width(10.dp))
@@ -1447,17 +1825,17 @@ private fun SourcesPickerDialog(
                     )
                     Text(
                         "${sources.size} mirror server${if (sources.size != 1) "s" else ""} available",
-                        color = Color.White.copy(0.6f),
+                        color = Color(0xFFB0B0B0),
                         fontSize = 12.sp
                     )
                 }
             }
             IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Default.Close, "Close", tint = Color.White.copy(0.7f), modifier = Modifier.size(18.dp))
+                Icon(Icons.Default.Close, "Close", tint = Color(0xFFB0B0B0), modifier = Modifier.size(18.dp))
             }
         }
 
-        HorizontalDivider(color = Color.White.copy(0.08f))
+        HorizontalDivider(color = Color(0x1AFFFFFF))
         Spacer(Modifier.height(14.dp))
 
         // Full Height Scrollable Item List
@@ -1469,7 +1847,7 @@ private fun SourcesPickerDialog(
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             sources.forEach { source ->
-                val isSelected = source.url == currentSource.url || source == currentSource
+                val isSelected = samePlaybackSource(source, currentSource)
                 val qualityLabel = detectQualityLabel(source)
                 val cleanedTitle = cleanServerTitle(source.name)
 
@@ -1479,10 +1857,10 @@ private fun SourcesPickerDialog(
                 ) {
                     // Quality Badge Pill
                     val (badgeBg, badgeTextColor) = when (qualityLabel) {
-                        "4K" -> Pair(Color(0xFFD97706), Color.White)
+                        "4K" -> Pair(Color(0xFFD97706), Color.Black)
                         "1080p" -> Pair(Color(0xFF0078D4), Color.White)
                         "720p" -> Pair(Color(0xFF107C41), Color.White)
-                        else -> Pair(Color(0xFF3F3F46), Color.White)
+                        else -> Pair(Color(0xFF333333), Color.White)
                     }
                     Surface(
                         color = badgeBg,
@@ -1510,7 +1888,7 @@ private fun SourcesPickerDialog(
                         Spacer(Modifier.height(2.dp))
                         Text(
                             source.url,
-                            color = Color.White.copy(0.5f),
+                            color = Color(0xFFB0B0B0),
                             fontSize = 11.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -1522,7 +1900,7 @@ private fun SourcesPickerDialog(
                         Icon(
                             Icons.Default.Check,
                             null,
-                            tint = Color(0xFF0078D4),
+                            tint = Color(0xFFE50914),
                             modifier = Modifier.size(18.dp)
                         )
                     }
@@ -1563,7 +1941,7 @@ private fun AudioTrackPickerDialog(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                     Icons.Default.Audiotrack, null,
-                    tint = Color(0xFF0078D4),
+                    tint = Color(0xFFE50914),
                     modifier = Modifier.size(20.dp)
                 )
                 Spacer(Modifier.width(10.dp))
@@ -1575,17 +1953,17 @@ private fun AudioTrackPickerDialog(
                     )
                     Text(
                         "Select active audio stream language",
-                        color = Color.White.copy(0.6f),
+                        color = Color(0xFFB0B0B0),
                         fontSize = 12.sp
                     )
                 }
             }
             IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Default.Close, "Close", tint = Color.White.copy(0.7f), modifier = Modifier.size(18.dp))
+                Icon(Icons.Default.Close, "Close", tint = Color(0xFFB0B0B0), modifier = Modifier.size(18.dp))
             }
         }
 
-        HorizontalDivider(color = Color.White.copy(0.08f))
+        HorizontalDivider(color = Color(0x1AFFFFFF))
         Spacer(Modifier.height(14.dp))
 
         Column(
@@ -1614,7 +1992,7 @@ private fun AudioTrackPickerDialog(
                         Icon(
                             Icons.Default.Check,
                             null,
-                            tint = Color(0xFF0078D4),
+                            tint = Color(0xFFE50914),
                             modifier = Modifier.size(18.dp)
                         )
                     }
@@ -1633,8 +2011,10 @@ private fun CombinedSubtitlePickerDialog(
     selectedExternal: SubtitleTrackInfo?,
     nativeTracks: List<TrackDescription>,
     selectedNativeId: Int?,
-    onSelectExternal: (SubtitleTrackInfo?) -> Unit,
+    status: String?,
+    onSelectExternal: (SubtitleTrackInfo) -> Unit,
     onSelectNative: (Int) -> Unit,
+    onDisable: () -> Unit,
     onDismiss: () -> Unit
 ) {
     RightSidebarDrawer(visible = visible, onDismiss = onDismiss, width = 440.dp) {
@@ -1648,7 +2028,7 @@ private fun CombinedSubtitlePickerDialog(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                     Icons.Default.ClosedCaption, null,
-                    tint = Color(0xFF0078D4),
+                    tint = Color(0xFFE50914),
                     modifier = Modifier.size(20.dp)
                 )
                 Spacer(Modifier.width(10.dp))
@@ -1660,17 +2040,17 @@ private fun CombinedSubtitlePickerDialog(
                     )
                     Text(
                         "Select subtitles track or embedded stream",
-                        color = Color.White.copy(0.6f),
+                        color = Color(0xFFB0B0B0),
                         fontSize = 12.sp
                     )
                 }
             }
             IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Default.Close, "Close", tint = Color.White.copy(0.7f), modifier = Modifier.size(18.dp))
+                Icon(Icons.Default.Close, "Close", tint = Color(0xFFB0B0B0), modifier = Modifier.size(18.dp))
             }
         }
 
-        HorizontalDivider(color = Color.White.copy(0.08f))
+        HorizontalDivider(color = Color(0x1AFFFFFF))
         Spacer(Modifier.height(14.dp))
 
         Column(
@@ -1680,23 +2060,21 @@ private fun CombinedSubtitlePickerDialog(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            SubtitleOption("Off", selectedExternal == null && (selectedNativeId == null || selectedNativeId == -1), onClick = {
-                onSelectExternal(null)
-                onSelectNative(-1)
-            })
+            status?.let { Text(it, color = Color(0xFFB0B0B0), fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp)) }
+            SubtitleOption("Off", selectedExternal == null && selectedNativeId == -1, onClick = onDisable)
 
             if (nativeTracks.isNotEmpty()) {
                 Spacer(Modifier.height(4.dp))
-                Text("Embedded Subtitles", color = Color(0xFF0078D4), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                Text("Embedded Subtitles", color = Color(0xFFE50914), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 nativeTracks.filter { it.id() != -1 }.forEach { track ->
-                    val isSelected = track.id() == selectedNativeId
+                    val isSelected = selectedExternal == null && track.id() == selectedNativeId
                     SubtitleOption(cleanAudioTrackName(track.description()), isSelected, onClick = { onSelectNative(track.id()) })
                 }
             }
 
             if (externalSubtitles.isNotEmpty()) {
                 Spacer(Modifier.height(4.dp))
-                Text("External Subtitles", color = Color(0xFF0078D4), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                Text("External Subtitles", color = Color(0xFFE50914), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 externalSubtitles.forEach { track ->
                     val isSelected = track == selectedExternal
                     SubtitleOption(
@@ -1738,7 +2116,7 @@ private fun EpisodesPickerDialog(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                     Icons.Default.VideoLibrary, null,
-                    tint = Color(0xFF0078D4),
+                    tint = Color(0xFFE50914),
                     modifier = Modifier.size(20.dp)
                 )
                 Spacer(Modifier.width(10.dp))
@@ -1750,30 +2128,30 @@ private fun EpisodesPickerDialog(
                     )
                     Text(
                         "${episodes.size} episode${if (episodes.size != 1) "s" else ""} available",
-                        color = Color.White.copy(0.6f),
+                        color = Color(0xFFB0B0B0),
                         fontSize = 12.sp
                     )
                 }
             }
             IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Default.Close, "Close", tint = Color.White.copy(0.7f), modifier = Modifier.size(18.dp))
+                Icon(Icons.Default.Close, "Close", tint = Color(0xFFB0B0B0), modifier = Modifier.size(18.dp))
             }
         }
 
-        HorizontalDivider(color = Color.White.copy(0.08f))
+        HorizontalDivider(color = Color(0x1AFFFFFF))
 
         if (seasons.size > 1) {
             Spacer(Modifier.height(12.dp))
             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 items(seasons) { season ->
                     val isSelected = selectedSeason == season
-                    val textColor by animateColorAsState(if (isSelected) Color.White else Color.White.copy(0.6f), tween(150))
+                    val textColor by animateColorAsState(if (isSelected) Color(0xFFE50914) else Color(0xFFB0B0B0), tween(150))
 
                     Surface(
                         onClick = { selectedSeason = season },
                         shape = RoundedCornerShape(5.dp),
-                        color = if (isSelected) Color(0xFF0078D4).copy(0.15f) else Color.Transparent,
-                        border = BorderStroke(1.dp, if (isSelected) Color(0xFF0078D4).copy(0.5f) else Color(0x18FFFFFF))
+                        color = if (isSelected) Color(0xFFE50914).copy(0.15f) else Color.Transparent,
+                        border = BorderStroke(1.dp, if (isSelected) Color(0xFFE50914) else Color(0x1AFFFFFF))
                     ) {
                         Text(
                             "Season $season",
@@ -1805,13 +2183,13 @@ private fun EpisodesPickerDialog(
                     onClick = { onSelect(ep) }
                 ) {
                     Surface(
-                        color = if (isSelected) Color(0xFF0078D4) else Color(0xFF3F3F46),
+                        color = if (isSelected) Color(0xFFE50914) else Color(0xFF333333),
                         shape = RoundedCornerShape(4.dp)
                     ) {
                         Text(
                             epLabel,
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                            color = Color.White,
+                            color = if (isSelected) Color.White else Color.White,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -1831,7 +2209,7 @@ private fun EpisodesPickerDialog(
                                 Spacer(Modifier.height(2.dp))
                                 Text(
                                     desc,
-                                    color = Color.White.copy(0.5f),
+                                    color = Color(0xFFB0B0B0),
                                     fontSize = 11.sp,
                                     maxLines = 2,
                                     overflow = TextOverflow.Ellipsis
@@ -1843,7 +2221,7 @@ private fun EpisodesPickerDialog(
                     if (isSelected) {
                         Icon(
                             Icons.Default.Check, null,
-                            tint = Color(0xFF0078D4),
+                            tint = Color(0xFFE50914),
                             modifier = Modifier.size(18.dp)
                         )
                     }
@@ -1870,7 +2248,7 @@ private fun SubtitleOption(label: String, isSelected: Boolean, onClick: () -> Un
             Icon(
                 Icons.Default.Check,
                 null,
-                tint = Color(0xFF0078D4),
+                tint = Color(0xFFE50914),
                 modifier = Modifier.size(18.dp)
             )
         }
@@ -1891,10 +2269,10 @@ private fun Win11SidebarOptionCard(
     Surface(
         onClick = onClick,
         shape = RoundedCornerShape(6.dp),
-        color = if (isSelected) Color(0xFF2C2C2C) else if (hovered) Color(0xFF323232) else Color(0xFF242424),
+        color = if (isSelected) Color(0xFF252525) else if (hovered) Color(0xFF333333) else Color(0xFF1C1C1C),
         border = BorderStroke(
             1.dp,
-            if (isSelected) Color(0xFF0078D4).copy(0.5f) else if (hovered) Color(0x26FFFFFF) else Color(0x18FFFFFF)
+            if (isSelected) Color(0xFFE50914) else if (hovered) Color(0x33FFFFFF) else Color(0x1AFFFFFF)
         ),
         modifier = Modifier.fillMaxWidth().hoverable(interactionSource)
     ) {
@@ -1908,7 +2286,7 @@ private fun Win11SidebarOptionCard(
                     .width(3.dp)
                     .fillMaxHeight()
                     .background(
-                        if (isSelected) Color(0xFF0078D4) else Color.Transparent,
+                        if (isSelected) Color(0xFFE50914) else Color.Transparent,
                         shape = RoundedCornerShape(2.dp)
                     )
             )
@@ -1938,10 +2316,10 @@ private fun SpeedPickerDialog(visible: Boolean, current: Float, onSelect: (Float
         ) {
             Text("Playback Speed", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold), color = Color.White)
             IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Default.Close, "Close", tint = Color.White.copy(0.7f), modifier = Modifier.size(18.dp))
+                Icon(Icons.Default.Close, "Close", tint = Color(0xFFB0B0B0), modifier = Modifier.size(18.dp))
             }
         }
-        HorizontalDivider(color = Color.White.copy(0.08f))
+        HorizontalDivider(color = Color(0x1AFFFFFF))
         Spacer(Modifier.height(14.dp))
         Column(
             modifier = Modifier.fillMaxWidth().weight(1f).verticalScroll(rememberScrollState()),
@@ -1974,17 +2352,17 @@ private fun VolumeDialog(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Volume", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold), color = Color.White)
                 Spacer(Modifier.width(8.dp))
-                Text("${volume}%", color = Color(0xFF0078D4), fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text("${volume}%", color = Color(0xFFE50914), fontWeight = FontWeight.Bold, fontSize = 13.sp)
             }
             IconButton(onClick = onDismiss, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Default.Close, "Close", tint = Color.White.copy(0.7f), modifier = Modifier.size(18.dp))
+                Icon(Icons.Default.Close, "Close", tint = Color(0xFFB0B0B0), modifier = Modifier.size(18.dp))
             }
         }
-        HorizontalDivider(color = Color.White.copy(0.08f))
+        HorizontalDivider(color = Color(0x1AFFFFFF))
         Spacer(Modifier.height(14.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = onMuteToggle) {
-                Icon(if (isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp, null, tint = if (isMuted) Color(0xFFCF6679) else Color.White)
+                Icon(if (isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp, null, tint = if (isMuted) Color(0xFFEF5350) else Color.White)
             }
             Slider(
                 value = volume.toFloat(),
@@ -1992,9 +2370,9 @@ private fun VolumeDialog(
                 valueRange = 0f..200f,
                 modifier = Modifier.weight(1f),
                 colors = SliderDefaults.colors(
-                    thumbColor = Color.White,
-                    activeTrackColor = Color(0xFF0078D4),
-                    inactiveTrackColor = Color.White.copy(0.15f)
+                    thumbColor = Color(0xFFE50914),
+                    activeTrackColor = Color(0xFFE50914),
+                    inactiveTrackColor = Color(0x33FFFFFF)
                 )
             )
         }
@@ -2013,31 +2391,31 @@ private fun FallbackDashboard(
     onCopy: () -> Unit, onLaunchVlc: () -> Unit, onOpenBrowser: () -> Unit
 ) {
     Box(
-        modifier = Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF0A0A0F), Color(0xFF12121A)))),
+        modifier = Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF121212), Color(0xFF1C1C1C)))),
         contentAlignment = Alignment.Center
     ) {
-        Card(modifier = Modifier.fillMaxWidth(0.7f), colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E2A)), shape = RoundedCornerShape(24.dp)) {
+        Card(modifier = Modifier.fillMaxWidth(0.7f), colors = CardDefaults.cardColors(containerColor = Color(0xFF252525)), shape = RoundedCornerShape(24.dp)) {
             Column(modifier = Modifier.padding(36.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(Icons.Default.PlayCircle, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(80.dp))
+                Icon(Icons.Default.PlayCircle, null, tint = Color(0xFFE50914), modifier = Modifier.size(80.dp))
                 Spacer(Modifier.height(16.dp))
                 Text(title, style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold), color = Color.White, textAlign = TextAlign.Center)
-                if (episodeName != null) Text(episodeName, color = MaterialTheme.colorScheme.primary, fontSize = 13.sp)
+                if (episodeName != null) Text(episodeName, color = Color(0xFFE50914), fontSize = 13.sp)
                 Spacer(Modifier.height(8.dp))
-                Text("VLC: $errorMsg", color = Color.Gray, fontSize = 12.sp, textAlign = TextAlign.Center)
+                Text("VLC: $errorMsg", color = Color(0xFFEF5350), fontSize = 12.sp, textAlign = TextAlign.Center)
                 Spacer(Modifier.height(24.dp))
-                Surface(modifier = Modifier.fillMaxWidth(), color = Color(0xFF141420), shape = RoundedCornerShape(12.dp)) {
+                Surface(modifier = Modifier.fillMaxWidth(), color = Color(0xFF1C1C1C), shape = RoundedCornerShape(12.dp)) {
                     Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Link, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Default.Link, null, tint = Color(0xFFE50914), modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(8.dp))
-                        Text(mediaUrl, color = Color.LightGray, fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        Text(mediaUrl, color = Color(0xFFB0B0B0), fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                         IconButton(onClick = onCopy) {
-                            Icon(if (isCopied) Icons.Default.Check else Icons.Default.ContentCopy, null, tint = MaterialTheme.colorScheme.primary)
+                            Icon(if (isCopied) Icons.Default.Check else Icons.Default.ContentCopy, null, tint = Color(0xFFE50914))
                         }
                     }
                 }
                 Spacer(Modifier.height(24.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Button(onClick = onLaunchVlc, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary), shape = RoundedCornerShape(10.dp)) {
+                    Button(onClick = onLaunchVlc, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE50914), contentColor = Color.White), shape = RoundedCornerShape(10.dp)) {
                         Icon(Icons.Default.PlayArrow, null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
                         Text("Launch VLC")

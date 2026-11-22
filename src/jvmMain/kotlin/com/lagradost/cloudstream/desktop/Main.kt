@@ -12,7 +12,7 @@ import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.window.WindowDraggableArea
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
+import androidx.compose.material.icons.filled.FilterNone
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CropSquare
 import androidx.compose.material.icons.filled.Minimize
@@ -26,6 +26,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.foundation.focusable
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -60,14 +61,7 @@ fun main() {
         // Load local desktop settings
         val settings = remember { DesktopDataStore.currentSettings }
         val windowState = rememberWindowState(width = 1280.dp, height = 800.dp)
-
-        val toggleFullscreen = {
-            windowState.placement = if (windowState.placement == WindowPlacement.Fullscreen) {
-                WindowPlacement.Floating
-            } else {
-                WindowPlacement.Fullscreen
-            }
-        }
+        var windowedPlacement by remember { mutableStateOf(WindowPlacement.Floating) }
 
         Window(
             onCloseRequest = ::exitApplication,
@@ -86,8 +80,29 @@ fun main() {
             CloudStreamDesktopTheme(darkTheme = settings.isDarkMode) {
                 var currentScreen by remember { mutableStateOf<DesktopScreen>(DesktopScreen.Home) }
                 val screenHistory = remember { mutableStateListOf<DesktopScreen>() }
+                var playerOwnsFullscreen by remember { mutableStateOf(false) }
+                var escapePressed by remember { mutableStateOf(false) }
+
+                val toggleFullscreen = {
+                    if (windowState.placement == WindowPlacement.Fullscreen) {
+                        windowState.placement = windowedPlacement
+                        playerOwnsFullscreen = false
+                    } else {
+                        windowedPlacement = windowState.placement
+                        playerOwnsFullscreen = currentScreen is DesktopScreen.Player
+                        windowState.placement = WindowPlacement.Fullscreen
+                    }
+                }
+
+                fun restorePlayerWindowIfNeeded(target: DesktopScreen) {
+                    if (currentScreen is DesktopScreen.Player && target !is DesktopScreen.Player && playerOwnsFullscreen) {
+                        if (windowState.placement == WindowPlacement.Fullscreen) toggleFullscreen()
+                        playerOwnsFullscreen = false
+                    }
+                }
 
                 fun navigateTo(screen: DesktopScreen, replaceCurrent: Boolean = false) {
+                    restorePlayerWindowIfNeeded(screen)
                     if (replaceCurrent) {
                         currentScreen = screen
                     } else {
@@ -97,6 +112,7 @@ fun main() {
                 }
 
                 fun navigateBack() {
+                    restorePlayerWindowIfNeeded(screenHistory.lastOrNull() ?: DesktopScreen.Home)
                     if (screenHistory.isNotEmpty()) {
                         currentScreen = screenHistory.removeLast()
                     } else {
@@ -105,26 +121,38 @@ fun main() {
                 }
 
                 val windowFocusRequester = remember { FocusRequester() }
+                var windowHasFocus by remember { mutableStateOf(false) }
+                var playerWindowShortcutsBlocked by remember { mutableStateOf(false) }
 
-                LaunchedEffect(Unit) {
-                    windowFocusRequester.requestFocus()
+                LaunchedEffect(isFullscreen) {
+                    withFrameNanos { }
+                    // Recover focus from removed window controls without taking it from surviving text fields.
+                    if (currentScreen !is DesktopScreen.Player && !windowHasFocus) windowFocusRequester.requestFocus()
                 }
 
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
                         .focusRequester(windowFocusRequester)
-                        .focusable()
+                        .onFocusChanged { windowHasFocus = it.hasFocus }
                         .onPreviewKeyEvent { event ->
-                            if (event.type == KeyEventType.KeyDown) {
+                            if (event.key == Key.F11) {
+                                if (event.type == KeyEventType.KeyUp &&
+                                    (currentScreen !is DesktopScreen.Player || !playerWindowShortcutsBlocked)) toggleFullscreen()
+                                true
+                            } else if (event.key == Key.Escape && currentScreen !is DesktopScreen.Player) {
+                                if (event.type == KeyEventType.KeyDown) escapePressed = true
+                                if (event.type == KeyEventType.KeyUp && escapePressed) {
+                                    escapePressed = false
+                                    if (isFullscreen) toggleFullscreen()
+                                    else if (currentScreen !is DesktopScreen.Home) navigateBack()
+                                }
+                                true
+                            } else if (event.type == KeyEventType.KeyDown) {
                                 val isCtrl = event.isCtrlPressed
                                 val isAlt = event.isAltPressed
 
                                 when {
-                                    event.key == Key.F11 -> {
-                                        toggleFullscreen()
-                                        true
-                                    }
                                     (isCtrl && event.key == Key.F) || (event.key == Key.Slash) -> {
                                         if (currentScreen !is DesktopScreen.Search) {
                                             navigateTo(DesktopScreen.Search())
@@ -152,7 +180,7 @@ fun main() {
                                         true
                                     }
                                     (isAlt && event.key == Key.DirectionLeft) ||
-                                    (currentScreen !is DesktopScreen.Player && currentScreen !is DesktopScreen.Home && (event.key == Key.Escape || event.key == Key.Backspace)) -> {
+                                    (currentScreen !is DesktopScreen.Player && currentScreen !is DesktopScreen.Home && event.key == Key.Backspace) -> {
                                         navigateBack()
                                         true
                                     }
@@ -160,16 +188,15 @@ fun main() {
                                 }
                             } else false
                         }
+                        .focusable()
                 ) {
                     // Custom dark title bar for windowed mode (hidden in Fullscreen)
                     if (!isFullscreen) {
-                        WindowDraggableArea {
-                            CustomTitleBar(
-                                title = "CloudStream Windows Desktop",
-                                windowState = windowState,
-                                onClose = ::exitApplication
-                            )
-                        }
+                        CustomTitleBar(
+                            title = "CloudStream Windows Desktop",
+                            windowState = windowState,
+                            onClose = ::exitApplication
+                        )
                     }
 
                     Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
@@ -216,6 +243,7 @@ fun main() {
                                         apiName = screen.apiName,
                                         isFullscreen = isFullscreen,
                                         onToggleFullscreen = toggleFullscreen,
+                                        onWindowShortcutsBlockedChange = { playerWindowShortcutsBlocked = it },
                                         onBack = { navigateBack() }
                                     )
 
@@ -246,8 +274,8 @@ private fun WindowScope.CustomTitleBar(
         modifier = Modifier
             .fillMaxWidth()
             .height(36.dp),
-        color = Color(0xFF1C1C1C),
-        border = BorderStroke(1.dp, Color(0x18FFFFFF))
+        color = Color(0xFF121212),
+        border = BorderStroke(1.dp, Color(0x1AFFFFFF))
     ) {
         Row(
             modifier = Modifier.fillMaxSize(),
@@ -255,22 +283,26 @@ private fun WindowScope.CustomTitleBar(
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             // Left: Logo + App Title
-            Row(
-                modifier = Modifier.padding(start = 12.dp),
-                verticalAlignment = Alignment.CenterVertically
+            WindowDraggableArea(
+                modifier = Modifier.weight(1f).fillMaxHeight()
             ) {
-                Image(
-                    painter = painterResource("icon.png"),
-                    contentDescription = null,
-                    modifier = Modifier.size(16.dp)
-                )
-                Spacer(Modifier.width(10.dp))
-                Text(
-                    title,
-                    color = Color(0x99FFFFFF),
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium
-                )
+                Row(
+                    modifier = Modifier.fillMaxSize().padding(start = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Image(
+                        painter = painterResource("icon.png"),
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        title,
+                        color = Color(0xFFB0B0B0),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
             }
 
             // Right: Windows Caption Control Buttons
@@ -281,11 +313,13 @@ private fun WindowScope.CustomTitleBar(
                 // Minimize
                 Win11CaptionButton(
                     icon = Icons.Default.Minimize,
+                    description = "Minimize",
                     onClick = { windowState.isMinimized = true }
                 )
                 // Maximize / Restore
                 Win11CaptionButton(
-                    icon = if (windowState.placement == WindowPlacement.Maximized) Icons.Default.CropSquare else Icons.Default.CheckBoxOutlineBlank,
+                    icon = if (windowState.placement == WindowPlacement.Maximized) Icons.Default.FilterNone else Icons.Default.CropSquare,
+                    description = if (windowState.placement == WindowPlacement.Maximized) "Restore window" else "Maximize window",
                     onClick = {
                         windowState.placement = if (windowState.placement == WindowPlacement.Maximized) {
                             WindowPlacement.Floating
@@ -297,6 +331,7 @@ private fun WindowScope.CustomTitleBar(
                 // Close
                 Win11CaptionButton(
                     icon = Icons.Default.Close,
+                    description = "Close",
                     isClose = true,
                     onClick = onClose
                 )
@@ -308,6 +343,7 @@ private fun WindowScope.CustomTitleBar(
 @Composable
 private fun Win11CaptionButton(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
+    description: String,
     isClose: Boolean = false,
     onClick: () -> Unit
 ) {
@@ -316,12 +352,12 @@ private fun Win11CaptionButton(
 
     val bgColor by animateColorAsState(
         if (hovered) {
-            if (isClose) Color(0xFFE81123) else Color(0x1AFFFFFF)
+            if (isClose) Color(0xFFE81123) else Color(0xFF333333)
         } else Color.Transparent,
         animationSpec = tween(120)
     )
     val iconColor by animateColorAsState(
-        if (hovered) Color.White else Color(0x99FFFFFF),
+        if (isClose && hovered) Color.White else if (hovered) Color.White else Color(0xFFB0B0B0),
         animationSpec = tween(120)
     )
 
@@ -340,7 +376,7 @@ private fun Win11CaptionButton(
     ) {
         Icon(
             icon,
-            contentDescription = null,
+            contentDescription = description,
             tint = iconColor,
             modifier = Modifier.size(12.dp)
         )

@@ -4,13 +4,11 @@ import com.lagradost.cloudstream3.app
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpHandler
 import com.sun.net.httpserver.HttpServer
-import kotlinx.coroutines.runBlocking
-import okhttp3.ConnectionPool
+import okhttp3.Call
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
-import okhttp3.Protocol
 import okhttp3.Request
-import java.io.InputStream
-import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.URLDecoder
 import java.net.URLEncoder
@@ -19,29 +17,27 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 object DesktopStreamProxy {
+    private const val DASH_PATH_PREFIX = "_dash/"
     private var server: HttpServer? = null
     private var port: Int = 18999
     private val DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
     private val client: OkHttpClient by lazy {
-        OkHttpClient.Builder()
+        app.baseClient.newBuilder()
             .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(90, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
-            .followRedirects(true)
-            .followSslRedirects(true)
-            .retryOnConnectionFailure(true)
-            // HTTP/2 support + connection pool for fast segment reuse
-            .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-            .connectionPool(ConnectionPool(32, 5, TimeUnit.MINUTES))
             .build()
     }
 
     private class ProxySession(
         val targetUrl: String,
-        val headers: Map<String, String>,
-        val baseUrl: String
-    )
+        val headers: Map<String, String>
+    ) {
+        val rootUrl = targetUrl.toHttpUrlOrNull()
+        @Volatile var baseUrl = rootUrl
+        val calls = ConcurrentHashMap.newKeySet<Call>()
+    }
 
     private val sessions = ConcurrentHashMap<String, ProxySession>()
 
@@ -69,8 +65,7 @@ object DesktopStreamProxy {
         val currentPort = startIfNeeded()
 
         val sessionId = java.util.UUID.randomUUID().toString().take(8)
-        val baseUrl = targetUrl.substringBeforeLast("/") + "/"
-        sessions[sessionId] = ProxySession(targetUrl, headers, baseUrl)
+        sessions[sessionId] = ProxySession(targetUrl, headers)
 
         val fileName = targetUrl.substringBefore("?").substringAfterLast("/").ifEmpty { "stream.m3u8" }
         val encodedUrl = URLEncoder.encode(targetUrl, "UTF-8")
@@ -78,57 +73,48 @@ object DesktopStreamProxy {
         return "http://127.0.0.1:$currentPort/proxy/$sessionId/$fileName?url=$encodedUrl"
     }
 
+    fun releaseProxiedUrl(proxiedUrl: String) {
+        val url = proxiedUrl.toHttpUrlOrNull() ?: return
+        if (url.host != "127.0.0.1" || url.port != port || url.pathSegments.firstOrNull() != "proxy") return
+        val sessionId = url.pathSegments.getOrNull(1) ?: return
+        sessions.remove(sessionId)?.calls?.forEach(Call::cancel)
+    }
+
     private class ProxyHandler : HttpHandler {
         override fun handle(exchange: HttpExchange) {
             try {
-                val path = exchange.requestURI.path.removePrefix("/")
+                val path = exchange.requestURI.rawPath.removePrefix("/")
                 val pathParts = path.split("/")
 
                 // Expecting path like: /proxy/{sessionId}/{fileName} or relative paths
                 if (pathParts.size < 2 || pathParts[0] != "proxy") {
-                    exchange.sendResponseHeaders(404, 0)
-                    exchange.responseBody.close()
+                    exchange.sendResponseHeaders(404, -1)
                     return
                 }
 
                 val sessionId = pathParts[1]
                 val session = sessions[sessionId]
-
-                val rawQuery = exchange.requestURI.rawQuery ?: ""
-                var targetUrlStr: String? = if (rawQuery.startsWith("url=") || rawQuery.contains("&url=")) {
-                    val rawEncoded = rawQuery.substringAfter("url=").substringBefore("&")
-                    try { URLDecoder.decode(rawEncoded, "UTF-8") } catch (_: Exception) { null }
-                } else null
-
-                if (targetUrlStr.isNullOrBlank() && session != null) {
-                    // Reconstruct target URL for sub-requests (e.g. /proxy/{sessionId}/segment_1.m4s)
-                    val relativeSubPath = pathParts.drop(2).joinToString("/")
-                    if (relativeSubPath.isNotBlank()) {
-                        val base = session.baseUrl
-                        targetUrlStr = if (base.endsWith("/")) base + relativeSubPath else "$base/$relativeSubPath"
-                        if (rawQuery.isNotBlank() && !rawQuery.startsWith("url=")) {
-                            targetUrlStr += "?$rawQuery"
-                        }
-                    } else {
-                        targetUrlStr = session.targetUrl
-                    }
+                if (session == null) {
+                    exchange.sendResponseHeaders(404, -1)
+                    return
                 }
 
+                val relativePath = pathParts.drop(2).joinToString("/")
+                val targetUrlStr = resolveTarget(relativePath, exchange.requestURI.rawQuery, session)
                 if (targetUrlStr.isNullOrBlank()) {
-                    exchange.sendResponseHeaders(400, 0)
-                    exchange.responseBody.close()
+                    exchange.sendResponseHeaders(400, -1)
                     return
                 }
 
                 val reqBuilder = Request.Builder().url(targetUrlStr)
 
                 // Inject session headers into target OkHttp request
-                session?.headers?.forEach { (k, v) ->
+                session.headers.forEach { (k, v) ->
                     reqBuilder.header(k, v)
                 }
 
                 // Inject default User-Agent if none provided (prevents Cloudflare/DDoS-Guard blocks)
-                val hasUA = session?.headers?.keys?.any { it.equals("user-agent", ignoreCase = true) } == true
+                val hasUA = session.headers.keys.any { it.equals("user-agent", ignoreCase = true) }
                 if (!hasUA) {
                     reqBuilder.header("User-Agent", DEFAULT_USER_AGENT)
                 }
@@ -139,132 +125,109 @@ object DesktopStreamProxy {
                     reqBuilder.header("Range", rangeHeader)
                 }
 
-                // Execute synchronously using CloudStream's shared OkHttpClient instance (app.baseClient)
-                // This shares cookie jar, connection pool, and SSL context without runBlocking or exception wrapping
-                println("[DesktopProxy] Requesting: $targetUrlStr (Headers: ${session?.headers})")
-                val response = try {
-                    app.baseClient.newCall(reqBuilder.build()).execute()
-                } catch (e: Exception) {
-                    println("[DesktopProxy] Request FAILED for $targetUrlStr: ${e.message}")
-                    throw e
-                }
-                println("[DesktopProxy] Response: ${response.code} ${response.message} for $targetUrlStr")
-                val responseBody = response.body
-
-                val isM3u8 = targetUrlStr.endsWith(".m3u8", ignoreCase = true) || 
-                             targetUrlStr.contains(".m3u8", ignoreCase = true) ||
-                             (response.headers["Content-Type"]?.contains("mpegurl", ignoreCase = true) == true)
-
-                if (isM3u8) {
-                    val bodyString = responseBody.string()
-                    if (bodyString.contains("#EXTM3U")) {
-                        fun resolveUrl(rawSegment: String): String {
-                            val trimmed = rawSegment.trim()
-                            return when {
-                                trimmed.startsWith("http://", ignoreCase = true) ||
-                                trimmed.startsWith("https://", ignoreCase = true) -> trimmed
-                                trimmed.startsWith("/") -> {
-                                    val uri = java.net.URI(targetUrlStr)
-                                    "${uri.scheme}://${uri.host}${if (uri.port != -1) ":${uri.port}" else ""}$trimmed"
-                                }
-                                else -> {
-                                    val base = targetUrlStr.substringBeforeLast("/") + "/"
-                                    base + trimmed
-                                }
-                            }
-                        }
-
-                        fun proxyUrl(rawSegment: String, fallbackName: String = "resource"): String {
-                            val resolved = resolveUrl(rawSegment)
-                            val fileName = resolved.substringBefore("?").substringAfterLast("/").ifEmpty { fallbackName }
-                            val encodedSegmentUrl = URLEncoder.encode(resolved, "UTF-8")
-                            return "http://127.0.0.1:${port}/proxy/$sessionId/$fileName?url=$encodedSegmentUrl"
-                        }
-
-                        // Regex to find URI="..." inside HLS tag attributes (e.g. EXT-X-KEY, EXT-X-MEDIA)
-                        val uriAttrRegex = Regex("""URI="([^"]+)"""")
-
-                        val lines = bodyString.lines().map { line ->
-                            val trimmed = line.trim()
-                            when {
-                                // Non-comment segment / sub-playlist line
-                                trimmed.isNotBlank() && !trimmed.startsWith("#") -> {
-                                    proxyUrl(trimmed, "segment.ts")
-                                }
-                                // HLS tag lines with URI="..." attribute (e.g. #EXT-X-KEY, #EXT-X-MEDIA)
-                                trimmed.startsWith("#") && trimmed.contains("URI=\"") -> {
-                                    uriAttrRegex.replace(trimmed) { matchResult ->
-                                        val originalUri = matchResult.groupValues[1]
-                                        val proxied = proxyUrl(originalUri, "key")
-                                        """URI="$proxied""""
-                                    }
-                                }
-                                else -> line
-                            }
-                        }
-                        val rewrittenBody = lines.joinToString("\n")
-                        val bytes = rewrittenBody.toByteArray(Charsets.UTF_8)
-                        exchange.responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl")
-                        exchange.responseHeaders.add("Access-Control-Allow-Origin", "*")
-                        exchange.sendResponseHeaders(response.code, bytes.size.toLong())
-                        exchange.responseBody.write(bytes)
-                        exchange.responseBody.flush()
-                        exchange.responseBody.close()
-                        response.close()
+                val call = client.newCall(reqBuilder.build())
+                session.calls.add(call)
+                try {
+                    // A release between lookup and registration must not start another upstream request.
+                    if (sessions[sessionId] !== session) {
+                        exchange.sendResponseHeaders(404, -1)
                         return
                     }
-                }
-
-                // Copy response headers back to VLC
-                response.headers.forEach { (k, v) ->
-                    if (!k.equals("Transfer-Encoding", ignoreCase = true) && !k.equals("Content-Length", ignoreCase = true)) {
-                        exchange.responseHeaders.add(k, v)
-                    }
-                }
-
-                if (targetUrlStr.endsWith(".mpd", ignoreCase = true) || targetUrlStr.contains("/dash/", ignoreCase = true)) {
-                    exchange.responseHeaders.set("Content-Type", "application/dash+xml")
-                } else if (isM3u8) {
-                    exchange.responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl")
-                }
-                exchange.responseHeaders.add("Access-Control-Allow-Origin", "*")
-
-                val contentLength = responseBody.contentLength()
-                // Java HttpServer: 0L = Chunked Transfer Encoding (stream body bytes), -1L = No Response Body at all
-                exchange.sendResponseHeaders(response.code, if (contentLength > 0) contentLength else 0L)
-
-                val input: InputStream = responseBody.byteStream()
-                val output: OutputStream = exchange.responseBody
-                try {
-                    val buffer = ByteArray(32768)
-                    var bytesRead: Int
-                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                        output.write(buffer, 0, bytesRead)
-                    }
-                    output.flush()
+                    forwardResponse(exchange, call, sessionId, session)
                 } finally {
-                    output.close()
-                    input.close()
-                    response.close()
+                    session.calls.remove(call)
                 }
-            } catch (e: Exception) {
-                try {
-                    exchange.sendResponseHeaders(500, 0)
-                    exchange.responseBody.close()
-                } catch (_: Exception) {}
+            } catch (_: Exception) {
+                if (exchange.responseCode == -1) {
+                    runCatching { exchange.sendResponseHeaders(502, -1) }
+                }
+            } finally {
+                // Closing the exchange first aborts the socket if a fixed-length body was truncated.
+                exchange.close()
             }
         }
 
-        private fun parseQueryParams(query: String): Map<String, String> {
-            val map = mutableMapOf<String, String>()
-            if (query.isBlank()) return map
-            for (param in query.split("&")) {
-                val pair = param.split("=", limit = 2)
-                if (pair.size == 2) {
-                    map[pair[0]] = pair[1]
+        private fun resolveTarget(relativePath: String, rawQuery: String?, session: ProxySession): String? {
+            if (relativePath.startsWith(DASH_PATH_PREFIX)) {
+                return DashManifest.resolve(relativePath.removePrefix(DASH_PATH_PREFIX), rawQuery)?.toString()
+            }
+            val encodedTarget = rawQuery?.split('&')?.firstOrNull { it.startsWith("url=") }?.removePrefix("url=")
+            val target = encodedTarget?.let { runCatching { URLDecoder.decode(it, "UTF-8") }.getOrNull() }
+            if (!target.isNullOrBlank()) return target
+            if (relativePath.isBlank()) return session.targetUrl
+            val reference = if (rawQuery == null) relativePath else "$relativePath?$rawQuery"
+            return session.baseUrl?.resolve(reference)?.toString()
+        }
+
+        private fun forwardResponse(exchange: HttpExchange, call: Call, sessionId: String, session: ProxySession) {
+            val requestUrl = call.request().url
+            call.execute().use { response ->
+                val responseUrl = response.request.url
+                val responseBody = response.body
+                val contentType = response.header("Content-Type")
+                val isMpd = response.isSuccessful && (
+                    requestUrl.encodedPath.endsWith(".mpd", ignoreCase = true) ||
+                        responseUrl.encodedPath.endsWith(".mpd", ignoreCase = true) ||
+                        contentType?.contains("dash+xml", ignoreCase = true) == true
+                    )
+                if (isMpd && requestUrl == session.rootUrl) session.baseUrl = responseUrl
+
+                val isM3u8 = !isMpd && response.isSuccessful && (
+                    requestUrl.encodedPath.endsWith(".m3u8", ignoreCase = true) ||
+                        responseUrl.encodedPath.endsWith(".m3u8", ignoreCase = true) ||
+                        contentType?.contains("mpegurl", ignoreCase = true) == true
+                    )
+                val playlistBytes = if (isM3u8) responseBody.bytes() else null
+                val playlist = playlistBytes?.toString(Charsets.UTF_8)?.removePrefix("\uFEFF")
+                val rewrittenHls = playlist?.takeIf { it.contains("#EXTM3U") }
+                    ?.let { rewriteHls(it, responseUrl, sessionId) }
+                val bufferedBody = if (isMpd && response.code == 200) {
+                    val proxyBase = "http://127.0.0.1:$port/proxy/$sessionId/$DASH_PATH_PREFIX"
+                    DashManifest.rewrite(responseBody.bytes(), responseUrl, proxyBase)
+                } else {
+                    rewrittenHls?.toByteArray(Charsets.UTF_8) ?: playlistBytes
+                }
+                if (rewrittenHls != null) {
+                    exchange.responseHeaders.set("Content-Type", "application/vnd.apple.mpegurl")
+                } else {
+                    response.headers.forEach { (key, value) ->
+                        if (!key.equals("Transfer-Encoding", ignoreCase = true) &&
+                            !key.equals("Content-Length", ignoreCase = true)) {
+                            exchange.responseHeaders.add(key, value)
+                        }
+                    }
+                    if (isMpd) exchange.responseHeaders.set("Content-Type", "application/dash+xml")
+                }
+                exchange.responseHeaders.set("Access-Control-Allow-Origin", "*")
+                val contentLength = bufferedBody?.size?.toLong() ?: responseBody.contentLength()
+                exchange.sendResponseHeaders(response.code, contentLength.coerceAtLeast(0L))
+                if (bufferedBody == null) {
+                    responseBody.byteStream().copyTo(exchange.responseBody, 32768)
+                } else {
+                    exchange.responseBody.write(bufferedBody)
                 }
             }
-            return map
+        }
+
+        private fun rewriteHls(playlist: String, responseUrl: HttpUrl, sessionId: String): String {
+            fun proxyUrl(rawUrl: String, fallbackName: String): String {
+                val resolved = responseUrl.resolve(rawUrl) ?: return rawUrl
+                val fileName = resolved.encodedPath.substringAfterLast('/').ifEmpty { fallbackName }
+                val encodedUrl = URLEncoder.encode(resolved.toString(), "UTF-8")
+                return "http://127.0.0.1:$port/proxy/$sessionId/$fileName?url=$encodedUrl"
+            }
+
+            val uriAttrRegex = Regex("""URI="([^"]+)"""")
+            return playlist.lineSequence().joinToString("\n") { line ->
+                val trimmed = line.trim()
+                when {
+                    trimmed.startsWith("#") -> uriAttrRegex.replace(line) { match ->
+                        """URI="${proxyUrl(match.groupValues[1], "key")}""""
+                    }
+                    trimmed.isNotEmpty() -> proxyUrl(trimmed, "segment.ts")
+                    else -> line
+                }
+            }
         }
     }
 }
