@@ -67,20 +67,32 @@ Run `CloudStream Desktop.msi` to complete setup.
 ### Option 2: Portable Build / Run from Source
 Prerequisites: JDK 17 or higher.
 
+The application includes its own Gradle 9.9.2 wrapper with a pinned SHA-256 distribution checksum. Kotlin 2.4.0's [fully supported Gradle range](https://kotlinlang.org/docs/gradle-configure-project.html) ends at 9.5.0; validate your build when changing either version. Existing plugins emit deprecation warnings.
+
 ```bash
-# Clone the repository
-git clone https://github.com/sheikhshariarnehal/Cloudstream-desktop-Application.git
+# Clone all three repositories into one parent directory.
+# Exact dependency revisions are recorded in build-dependencies.json.
+git clone https://github.com/sheikhshariarnehal/Cloudstream-desktop.git Cloudstream-desktop-Application
+git clone https://github.com/recloudstream/cloudstream.git cloudstream
+git -C cloudstream checkout --detach 2dcc25c3945c61dfa95d1710ced7c74acfe84baa
+git clone https://github.com/nehalDIU/nehal-CloudStream.git nehal-CloudStream
+git -C nehal-CloudStream checkout --detach 673f061d7a796a693cb744c218e9f4141a9867fe
 cd Cloudstream-desktop-Application
 
+# Run regression tests
+.\gradlew.bat jvmTest --max-workers=2
+
 # Run application locally
-..\cloudstream\gradlew.bat run
+.\gradlew.bat run
 
 # Create MSI Installer Package
-..\cloudstream\gradlew.bat packageMsi
+.\gradlew.bat packageMsi --max-workers=2
 ```
 
 The compiled MSI installer will be generated at:
 `build/compose/binaries/main/msi/CloudStream Desktop-1.0.3.msi`
+
+Windows source builds also require a VLC installation matching the JVM architecture for playback. Provider registration and JVM tests do not verify every live provider or physical audio device. The Windows workflow checks out the same pinned dependencies, runs tests and packages the MSI.
 
 ---
 

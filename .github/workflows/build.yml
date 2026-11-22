@@ -2,37 +2,78 @@ name: Build Windows Desktop App
 
 on:
   push:
-    branches: [ main ]
+    branches: [main, 'release/**', 'fix/**', 'build/**']
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: windows-latest
-
+    timeout-minutes: 45
     steps:
-      - name: Checkout repository
+      - name: Checkout desktop application
         uses: actions/checkout@v4
+        with:
+          path: desktop
+          persist-credentials: false
+
+      - name: Read pinned dependency revisions
+        id: dependencies
+        shell: pwsh
+        run: |
+          $dependencies = Get-Content desktop/build-dependencies.json -Raw | ConvertFrom-Json
+          "core_repository=$($dependencies.core.repository)" >> $env:GITHUB_OUTPUT
+          "core_revision=$($dependencies.core.revision)" >> $env:GITHUB_OUTPUT
+          "providers_repository=$($dependencies.providers.repository)" >> $env:GITHUB_OUTPUT
+          "providers_revision=$($dependencies.providers.revision)" >> $env:GITHUB_OUTPUT
+
+      - name: Checkout pinned core
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.dependencies.outputs.core_repository }}
+          ref: ${{ steps.dependencies.outputs.core_revision }}
+          path: cloudstream
+          persist-credentials: false
+
+      - name: Checkout pinned providers
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.dependencies.outputs.providers_repository }}
+          ref: ${{ steps.dependencies.outputs.providers_revision }}
+          path: nehal-CloudStream
+          persist-credentials: false
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
+          distribution: zulu
           java-version: '17'
-          cache: 'gradle'
+          cache: gradle
+          cache-dependency-path: |
+            desktop/build-dependencies.json
+            desktop/**/*.gradle*
+            cloudstream/gradle/libs.versions.toml
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew || true
-        shell: bash
+      - name: Test and package Windows application
+        working-directory: desktop
+        shell: pwsh
+        run: .\gradlew.bat jvmTest packageMsi --no-daemon --max-workers=2
 
-      - name: Compile Kotlin JVM
-        run: .\gradlew.bat compileKotlinJvm --no-daemon
-
-      - name: Build MSI Installer Package
-        run: .\gradlew.bat packageMsi --no-daemon
-
-      - name: Upload MSI Artifact
+      - name: Upload MSI artifact
         uses: actions/upload-artifact@v4
         with:
           name: CloudStream-Desktop-Installer
-          path: build/compose/binaries/main/msi/*.msi
+          path: desktop/build/compose/binaries/main/msi/*.msi
+          if-no-files-found: error
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JVM-test-reports
+          path: desktop/build/reports/tests/jvmTest/
+          if-no-files-found: ignore
